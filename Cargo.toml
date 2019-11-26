@@ -1,0 +1,13 @@
+[package]
+name = "megarust"
+version = "0.1.0"
+authors = ["Carson Swoveland <sciencedude2003@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitfield = "0.13.2"
+num-traits = "0.2.10"
+num-derive = "0.3.0"
+bitpat = "0.1.1"
