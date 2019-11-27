@@ -7,6 +7,8 @@ extern crate bitpat;
 #[macro_use]
 extern crate num_derive;
 
+extern crate either;
+
 extern crate num_traits;
 
 pub mod cart;
@@ -28,10 +30,10 @@ fn get_two_bytes(data: &[u8]) -> [u8; 2] {
 }
 
 pub fn run(cart: Cart) {
-    let mut cpu = Cpu::new();
+    let mut cpu = Cpu::new(&cart.rom_data);
 
     loop {
-        cpu.do_cycle(&cart.rom_data);
+        cpu.do_cycle();
     }
 }
 
