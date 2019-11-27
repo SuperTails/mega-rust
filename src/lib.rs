@@ -11,11 +11,19 @@ extern crate either;
 
 extern crate num_traits;
 
+extern crate sdl2;
+
 pub mod cart;
 mod cpu;
+mod vdp;
+mod sdl_system;
 
 use cart::Cart;
 use cpu::Cpu;
+use vdp::Vdp;
+use std::cell::RefCell;
+use std::rc::Rc;
+use sdl_system::SDLSystem;
 
 fn get_four_bytes(data: &[u8]) -> [u8; 4] {
     let mut result = [0; 4];
@@ -29,11 +37,19 @@ fn get_two_bytes(data: &[u8]) -> [u8; 2] {
     result
 }
 
+struct System {
+    cpu: Cpu,
+    vdp: Vdp,
+}
+
 pub fn run(cart: Cart) {
-    let mut cpu = Cpu::new(&cart.rom_data);
+    let mut vdp = Rc::new(RefCell::new(Vdp::new()));
+    let mut cpu = Cpu::new(&cart.rom_data, Rc::downgrade(&vdp));
+    let mut sdl_system = SDLSystem::new();
 
     loop {
         cpu.do_cycle();
+        vdp.borrow_mut().do_cycle(&mut sdl_system);
     }
 }
 

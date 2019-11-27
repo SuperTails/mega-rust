@@ -1,5 +1,5 @@
 use num_traits::FromPrimitive;
-use super::{Cpu, Ccr};
+use super::{Cpu, Ccr, LOG_INSTR};
 use either::Either;
 use std::convert::TryFrom;
 
@@ -644,7 +644,7 @@ impl Instr for Miscellaneous {
 
                 cpu.core.pc = new;
 
-                println!("Returning, PC will be {:#X}", cpu.core.pc + 2);
+                if LOG_INSTR { println!("Returning, PC will be {:#X}", cpu.core.pc + 2) }
             }
             Miscellaneous::MoveM(direction, size, mode) => {
                 match mode {
@@ -831,11 +831,11 @@ impl Instr for Branch {
 
             cpu.core.pc = cpu.core.pc.wrapping_add(displacement as u32);
 
-            println!("JSR, PC will be {:#X}", cpu.core.pc + 2);
+            if LOG_INSTR { println!("JSR, PC will be {:#X}", cpu.core.pc + 2); }
         }
         else if self.condition.check(&cpu.core.ccr) {
             cpu.core.pc = cpu.core.pc.wrapping_add(displacement as u32);
-            println!("Branch taken, PC will be {:#X}", cpu.core.pc + 2);
+            if LOG_INSTR { println!("Branch taken, PC will be {:#X}", cpu.core.pc + 2); }
         }
     }
 }

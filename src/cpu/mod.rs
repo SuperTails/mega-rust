@@ -1,8 +1,13 @@
 pub mod instruction;
 
+use std::rc::Weak;
+use std::cell::RefCell;
 use crate::get_four_bytes;
 use crate::get_two_bytes;
+use crate::vdp::Vdp;
 use instruction::{Instruction, Size};
+
+const LOG_INSTR: bool = false;
 
 bitfield! {
     #[derive(Clone, Copy)]
@@ -40,10 +45,11 @@ pub struct Cpu {
     pub rom: Box<[u8]>,
     pub cart_ram: Box<[u8]>,
     pub ram: [u8; 0x10000],
+    vdp: Weak<RefCell<Vdp>>,
 }
 
 impl Cpu {
-    pub fn new(rom: &[u8]) -> Cpu {
+    pub fn new(rom: &[u8], vdp: Weak<RefCell<Vdp>>) -> Cpu {
         let rom: Box<[u8]> = rom.into();
         let cart_ram = {
             let mut cart_ram = Vec::new();   
@@ -56,6 +62,7 @@ impl Cpu {
             rom,
             cart_ram,
             ram: [0; 0x10000],
+            vdp,
         }
     }
 
@@ -66,6 +73,11 @@ impl Cpu {
         let addr = (addr & 0xFF_FF_FF) as usize;
 
         assert_eq!(addr & (align - 1), 0);
+
+        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
+            let vdp = self.vdp.upgrade().unwrap();
+            return vdp.borrow_mut().read(addr as u32) as u32;
+        }
 
         let mut result = 0;
 
@@ -96,6 +108,12 @@ impl Cpu {
         let addr = (addr & 0xFF_FF_FF) as usize;
 
         assert_eq!(addr & (align - 1), 0, "Addr: {:#06X}", addr);
+
+        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
+            let vdp = self.vdp.upgrade().unwrap();
+            vdp.borrow_mut().write(addr as u32, value);
+            return;
+        }
 
         let value = value.to_be_bytes();
 
@@ -141,7 +159,7 @@ impl Cpu {
 
                     let offset = self.core.pc as usize % self.rom.len();
 
-                    print!("PC:{:08X}, A7: {:08X} ", self.core.pc, self.core.addr[7]);
+                    if LOG_INSTR { print!("PC:{:08X}, A7: {:08X} ", self.core.pc, self.core.addr[7]); }
 
                     let instr = Instruction::new(
                         u16::from_be_bytes(
@@ -149,9 +167,7 @@ impl Cpu {
                         )
                     );
 
-                    let last_pc = self.core.pc;
-
-                    println!("Instr: {:?}", instr);
+                    if LOG_INSTR { println!("Instr: {:?}", instr); }
 
                     // TODO: Cycle counts
                     instr.execute(self);
