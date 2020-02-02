@@ -1,227 +1,13 @@
 use super::{Ccr, Cpu, LOG_INSTR};
 use either::Either;
 use num_traits::FromPrimitive;
-pub use pages::*;
 use std::convert::TryFrom;
 use std::fmt;
+pub use pages::*;
+pub use addressing::*;
 
 mod pages;
-
-#[derive(PartialEq)]
-pub enum AddrMode {
-    DataReg(u8),
-    AddrReg(u8),
-    Addr(u8),
-    AddrPostIncr(u8),
-    AddrPreDecr(u8),
-    AddrDisp(u8),
-    AddrIndex(u8),
-    PcDisp,
-    PcIndex,
-    AbsShort,
-    AbsLong,
-    Immediate,
-}
-
-impl fmt::Debug for AddrMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AddrMode::DataReg(d) => write!(f, "d{}", d),
-            AddrMode::AddrReg(d) => write!(f, "a{}", d),
-            AddrMode::Immediate => write!(f, "#imm"),
-            AddrMode::AddrPostIncr(d) => write!(f, "(a{})+", d),
-            AddrMode::AddrPreDecr(d) => write!(f, "-(a{})", d),
-            AddrMode::Addr(d) => write!(f, "(a{})", d),
-            AddrMode::PcDisp => write!(f, "pc($disp)"),
-            AddrMode::PcIndex => write!(f, "PC INDEX"),
-            AddrMode::AbsShort => write!(f, "($addr).w"),
-            AddrMode::AbsLong => write!(f, "($addr).l"),
-            AddrMode::AddrDisp(d) => write!(f, "$addr(a{})", d),
-            AddrMode::AddrIndex(d) => write!(f, "$addr(a{}, INDEX REG)", d),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Address {
-    DataReg(u8),
-    AddrReg(u8),
-    Address(u32),
-}
-
-impl Address {
-    pub fn read(&self, size: Size, cpu: &mut Cpu) -> u32 {
-        match self {
-            Address::DataReg(reg) => DataReg::new(*reg).read_sized(size, cpu),
-            Address::AddrReg(reg) => AddrReg::new(*reg).read_sized(size, cpu),
-            Address::Address(addr) => cpu.read(*addr, size),
-        }
-    }
-
-    pub fn write(&self, value: u32, size: Size, cpu: &mut Cpu) {
-        match self {
-            Address::DataReg(reg) => {
-                DataReg::new(*reg).write_sized(value, size, cpu);
-            }
-            Address::AddrReg(reg) => {
-                AddrReg::new(*reg).write_sized(value, size, cpu);
-            }
-            Address::Address(addr) => cpu.write(*addr, value, size),
-        }
-    }
-}
-
-impl AddrMode {
-    pub fn new(data: u8) -> AddrMode {
-        assert!(data <= 0x3F);
-
-        let mode = data >> 3;
-        let field = data & 0x7;
-
-        match mode {
-            0 => AddrMode::DataReg(field),
-            1 => AddrMode::AddrReg(field),
-            2 => AddrMode::Addr(field),
-            3 => AddrMode::AddrPostIncr(field),
-            4 => AddrMode::AddrPreDecr(field),
-            5 => AddrMode::AddrDisp(field),
-            6 => AddrMode::AddrIndex(field),
-            7 => match field {
-                2 => AddrMode::PcDisp,
-                3 => AddrMode::PcIndex,
-                0 => AddrMode::AbsShort,
-                1 => AddrMode::AbsLong,
-                4 => AddrMode::Immediate,
-                _ => panic!(),
-            },
-            _ => unreachable!(),
-        }
-    }
-
-    // TODO: HOW DOES THIS WORK AT ALL?!
-    // TODO: HOW TO FIND SCALE
-    fn address_index(&self, extra: u32, cpu: &mut Cpu, reg: u32) -> Address {
-        let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
-        let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8;
-
-        if LOG_INSTR {
-            print!("Base offset of {:#X} ", offset);
-        }
-
-        // False is data, true is address
-        let reg_type = (index_info >> 7) != 0;
-        let reg_index = (index_info >> 4) & 0x7;
-        let reg_offset = if reg_type {
-            if LOG_INSTR {
-                println!("and using register a{}", reg_index);
-            }
-            cpu.core.addr[reg_index as usize]
-        } else {
-            if LOG_INSTR {
-                println!("and using register d{}", reg_index);
-            }
-            cpu.core.data[reg_index as usize]
-        };
-
-        if index_info & 0x7 != 0 {
-            unimplemented!(
-                "Don't know what the low three bits of {:#b} means",
-                index_info
-            )
-        }
-
-        Address::Address(reg.wrapping_add(reg_offset).wrapping_add(offset as u32))
-    }
-
-    pub fn address(&self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> Address {
-        let extra = if has_immediate {
-            (size.len() as u32 + 1) / 2 * 2
-        } else {
-            0
-        };
-        match self {
-            AddrMode::AbsLong => Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Long)),
-            AddrMode::AbsShort => {
-                Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Word) as i16 as i32 as u32)
-            }
-            AddrMode::PcDisp => {
-                // TODO: Is the displacement signed?
-                let offset = cpu.read(cpu.core.pc + extra + 2, Size::Word);
-                Address::Address(cpu.core.pc + 2 + offset)
-            }
-            AddrMode::PcIndex => self.address_index(extra, cpu, cpu.core.pc + 2),
-            AddrMode::AddrIndex(reg) => {
-                let reg = cpu.core.addr[*reg as usize];
-                self.address_index(extra, cpu, reg)
-            }
-            AddrMode::DataReg(reg) => Address::DataReg(*reg),
-            AddrMode::AddrReg(reg) => Address::AddrReg(*reg),
-            AddrMode::AddrPreDecr(reg) | AddrMode::AddrPostIncr(reg) | AddrMode::Addr(reg) => {
-                Address::Address(cpu.core.addr[*reg as usize])
-            }
-            AddrMode::AddrDisp(reg) => {
-                let offset = cpu.read(cpu.core.pc + 2 + extra, Size::Word) as i16 as i32 as u32;
-                let reg = cpu.core.addr[*reg as usize];
-
-                let address = reg.wrapping_add(offset);
-
-                Address::Address(address)
-            }
-            AddrMode::Immediate => Address::Address(cpu.core.pc + 2 + extra),
-        }
-    }
-
-    pub fn read(&self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> u32 {
-        if let AddrMode::AddrPreDecr(reg) = self {
-            let reg = &mut cpu.core.addr[*reg as usize];
-            *reg = reg.wrapping_sub(size.len() as u32);
-        }
-        let address = self.address(has_immediate, size, cpu);
-        if let AddrMode::AddrPostIncr(reg) = self {
-            let reg = &mut cpu.core.addr[*reg as usize];
-            *reg = reg.wrapping_add(size.len() as u32);
-        }
-        address.read(size, cpu)
-    }
-
-    pub fn write(&self, value: u32, has_immediate: bool, size: Size, cpu: &mut Cpu) {
-        if let AddrMode::AddrPreDecr(reg) = self {
-            let reg = &mut cpu.core.addr[*reg as usize];
-            *reg = reg.wrapping_sub(size.len() as u32);
-        }
-        let address = self.address(has_immediate, size, cpu);
-        if let AddrMode::AddrPostIncr(reg) = self {
-            let reg = &mut cpu.core.addr[*reg as usize];
-            *reg = reg.wrapping_add(size.len() as u32);
-        }
-        address.write(value, size, cpu)
-    }
-
-    pub fn arg_length(&self, size: Size) -> u32 {
-        match self {
-            AddrMode::Immediate => {
-                if size == Size::Long {
-                    4
-                } else {
-                    2
-                }
-            }
-
-            AddrMode::DataReg(_)
-            | AddrMode::AddrReg(_)
-            | AddrMode::AddrPreDecr(_)
-            | AddrMode::AddrPostIncr(_)
-            | AddrMode::Addr(_) => 0,
-
-            AddrMode::AbsLong => 4,
-
-            // TODO: Number of extension words can vary?!
-            AddrMode::PcIndex | AddrMode::AddrIndex(_) => 2,
-
-            AddrMode::AbsShort | AddrMode::PcDisp | AddrMode::AddrDisp(_) => 2,
-        }
-    }
-}
+mod addressing;
 
 #[derive(Debug, FromPrimitive, PartialEq)]
 pub enum Condition {
@@ -372,80 +158,6 @@ impl Size {
             Size::Word => 2,
             Size::Long => 2,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DataReg(u8);
-
-impl DataReg {
-    pub fn new(reg: u8) -> DataReg {
-        assert!(reg < 8);
-        DataReg(reg)
-    }
-
-    pub fn read(self, cpu: &Cpu) -> u32 {
-        cpu.core.data[self.0 as usize]
-    }
-
-    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
-        cpu.core.data[self.0 as usize] & size.mask()
-    }
-
-    pub fn write(self, value: u32, cpu: &mut Cpu) {
-        cpu.core.data[self.0 as usize] = value;
-    }
-
-    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
-        cpu.core.data[self.0 as usize] &= !size.mask();
-        cpu.core.data[self.0 as usize] |= value & size.mask();
-    }
-
-    pub fn into_inner(self) -> u8 {
-        self.0
-    }
-}
-
-impl Into<u8> for DataReg {
-    fn into(self) -> u8 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AddrReg(u8);
-
-impl AddrReg {
-    pub fn new(reg: u8) -> AddrReg {
-        assert!(reg < 8);
-        AddrReg(reg)
-    }
-
-    pub fn read(self, cpu: &Cpu) -> u32 {
-        cpu.core.addr[self.0 as usize]
-    }
-
-    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
-        cpu.core.addr[self.0 as usize] & size.mask()
-    }
-
-    pub fn write(self, value: u32, cpu: &mut Cpu) {
-        cpu.core.addr[self.0 as usize] = value;
-    }
-
-    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
-        cpu.core.addr[self.0 as usize] &= !size.mask();
-        cpu.core.addr[self.0 as usize] |= value & size.mask();
-    }
-
-    pub fn into_inner(self) -> u8 {
-        self.0
-    }
-}
-
-impl Into<u8> for AddrReg {
-    fn into(self) -> u8 {
-        self.0
     }
 }
 
@@ -773,21 +485,13 @@ impl Instr for Miscellaneous {
         }
     }
 
-    // TODO: oh god please no
     fn execute(&self, cpu: &mut Cpu) {
         match self {
             Miscellaneous::Link(reg) => {
-                cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
-                cpu.write(cpu.core.addr[7], reg.read(cpu), Size::Long);
-                reg.write(cpu.core.addr[7], cpu);
-                let disp = cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32 as u32;
-                cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp);
+                Miscellaneous::link(*reg, cpu);
             }
             Miscellaneous::Unlink(reg) => {
-                cpu.core.addr[7] = reg.read(cpu);
-                let disp = cpu.read(cpu.core.addr[7], Size::Long);
-                reg.write(disp, cpu);
-                cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
+                Miscellaneous::unlink(*reg, cpu);
             }
             Miscellaneous::Neg(size, mode) => {
                 let mut value = mode.read(false, *size, cpu);
@@ -800,21 +504,9 @@ impl Instr for Miscellaneous {
                 let result = (value << 16) | (value >> 16);
                 reg.write(result, cpu);
             }
-            Miscellaneous::Ext(size, reg) => match size {
-                Size::Word => {
-                    let result = reg.read(cpu) as i8 as i16 as u32;
-                    cpu.core.ccr.set_zero(result == 0);
-                    cpu.core.ccr.set_negative_sized(result, Size::Word);
-                    reg.write_sized(result, Size::Word, cpu);
-                }
-                Size::Long => {
-                    let result = reg.read(cpu) as i16 as i32 as u32;
-                    cpu.core.ccr.set_zero(result == 0);
-                    cpu.core.ccr.set_negative_sized(result, Size::Long);
-                    reg.write_sized(result, Size::Long, cpu);
-                }
-                _ => unreachable!(),
-            },
+            Miscellaneous::Ext(size, reg) => {
+                Miscellaneous::ext(*size, *reg, cpu);
+            }
             Miscellaneous::Test(size, mode) => {
                 if let Some(size) = size {
                     let value = mode.read(false, *size, cpu);
@@ -878,131 +570,7 @@ impl Instr for Miscellaneous {
                 cpu.core.ccr.set_zero(true);
             }
             Miscellaneous::MoveM(direction, size, mode) => {
-                let extend = |val: u32| -> u32 {
-                    match size {
-                        Size::Byte => val as i8 as i32 as u32,
-                        Size::Word => val as i16 as i32 as u32,
-                        Size::Long => val,
-                    }
-                };
-
-                match mode {
-                    AddrMode::AbsLong | AddrMode::AbsShort => {
-                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
-
-                        let mut addr =
-                            if let Address::Address(addr) = mode.address(true, Size::Word, cpu) {
-                                addr
-                            } else {
-                                unreachable!()
-                            };
-
-                        for i in 0..16 {
-                            if (mask >> i) & 1 != 0 {
-                                if *direction {
-                                    let value = extend(cpu.read(addr, *size));
-                                    let dst = if i >= 8 {
-                                        &mut cpu.core.addr
-                                    } else {
-                                        &mut cpu.core.data
-                                    };
-                                    dst[i % 8] = value;
-                                } else {
-                                    let src = if i >= 8 {
-                                        &cpu.core.addr
-                                    } else {
-                                        &cpu.core.data
-                                    };
-                                    let value = src[i % 8];
-                                    cpu.write(addr, value, *size);
-                                }
-
-                                addr += size.len() as u32;
-                            }
-                        }
-                    }
-                    AddrMode::AddrPreDecr(reg) => {
-                        // Only register-to-memory transfers are allowed in this mode
-                        assert_eq!(*direction, false);
-
-                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
-
-                        let reg = *reg as usize;
-
-                        for i in 0..16 {
-                            if (mask >> i) & 1 != 0 {
-                                cpu.core.addr[reg] =
-                                    cpu.core.addr[reg].wrapping_sub(size.len() as u32);
-
-                                if i < 8 {
-                                    cpu.write(cpu.core.addr[reg], cpu.core.addr[7 - (i % 8)], *size)
-                                } else {
-                                    cpu.write(cpu.core.addr[reg], cpu.core.data[7 - (i % 8)], *size)
-                                }
-                            }
-                        }
-                    }
-                    AddrMode::AddrPostIncr(reg) => {
-                        // Only memory-to-register transfers are allowed in this mode
-                        assert_eq!(*direction, true);
-
-                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
-
-                        let reg = *reg as usize;
-
-                        for i in 0..16 {
-                            if (mask >> i) & 1 != 0 {
-                                let value = cpu.read(cpu.core.addr[reg], *size);
-
-                                if i >= 8 {
-                                    cpu.core.addr[i % 8] = extend(value);
-                                } else {
-                                    cpu.core.data[i % 8] = extend(value);
-                                }
-
-                                cpu.core.addr[reg] =
-                                    cpu.core.addr[reg].wrapping_add(size.len() as u32);
-                            }
-                        }
-                    }
-                    AddrMode::Addr(reg) => {
-                        let mask = (cpu.read(cpu.core.pc + 2, Size::Word) as u16).swap_bytes();
-
-                        // false -> register to memory
-                        // true -> memory to register
-
-                        let mut addr = cpu.core.addr[*reg as usize];
-                        for i in 0..16 {
-                            if (mask >> i) & 1 != 0 {
-                                if *direction {
-                                    let value = cpu.read(addr, *size);
-                                    let dst = if i >= 8 {
-                                        &mut cpu.core.data
-                                    } else {
-                                        &mut cpu.core.addr
-                                    };
-                                    dst[i % 8] = value;
-                                } else {
-                                    let src = if i >= 8 {
-                                        &cpu.core.addr
-                                    } else {
-                                        &cpu.core.data
-                                    };
-                                    let value = src[i % 8];
-                                    cpu.write(addr, value, *size);
-                                }
-
-                                addr = addr.wrapping_add(size.len() as u32);
-                            }
-                        }
-                    }
-                    _ => unimplemented!(
-                        "Mode {:?}, direction: {:?}, size: {:?}",
-                        mode,
-                        direction,
-                        size
-                    ),
-                }
+                Miscellaneous::movem(*direction, *size, *mode, cpu);
             }
             Miscellaneous::MoveUsp(dir, reg) => {
                 // TODO: Check if these are swapped
@@ -1033,6 +601,169 @@ impl Instr for Miscellaneous {
                 cpu.core.ccr.set_negative_sized(result, *size);
                 mode.write(result, false, *size, cpu);
             }
+        }
+    }
+}
+
+impl Miscellaneous {
+    fn link(reg: AddrReg, cpu: &mut Cpu) {
+        cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
+        cpu.write(cpu.core.addr[7] , reg.read(cpu), Size::Long);
+        reg.write(cpu.core.addr[7], cpu);
+        let disp = cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32 as u32;
+        cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp);
+    }
+
+    fn unlink(reg: AddrReg, cpu: &mut Cpu) {
+        cpu.core.addr[7] = reg.read(cpu);
+        let disp = cpu.read(cpu.core.addr[7], Size::Long);
+        reg.write(disp, cpu);
+        cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
+    }
+
+    fn ext(size: Size, reg: DataReg, cpu: &mut Cpu) {
+        match size {
+            Size::Word => {
+                let result = reg.read(cpu) as i8 as i16 as u32;
+                cpu.core.ccr.set_zero(result == 0);
+                cpu.core.ccr.set_negative_sized(result, Size::Word);
+                reg.write_sized(result, Size::Word, cpu);
+            }
+            Size::Long => {
+                let result = reg.read(cpu) as i16 as i32 as u32;
+                cpu.core.ccr.set_zero(result == 0);
+                cpu.core.ccr.set_negative_sized(result, Size::Long);
+                reg.write_sized(result, Size::Long, cpu);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn movem(direction: bool, size: Size, mode: AddrMode, cpu: &mut Cpu) {
+        let extend = |val: u32| -> u32 {
+            match size {
+                Size::Byte => val as i8 as i32 as u32,
+                Size::Word => val as i16 as i32 as u32,
+                Size::Long => val,
+            }
+        };
+
+        match mode {
+            AddrMode::AbsLong | AddrMode::AbsShort => {
+                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+
+                let mut addr =
+                    if let Address::Address(addr) = mode.address(true, Size::Word, cpu) {
+                        addr
+                    } else {
+                        unreachable!()
+                    };
+
+                for i in 0..16 {
+                    if (mask >> i) & 1 != 0 {
+                        if direction {
+                            let value = extend(cpu.read(addr, size));
+                            let dst = if i >= 8 {
+                                &mut cpu.core.addr
+                            } else {
+                                &mut cpu.core.data
+                            };
+                            dst[i % 8] = value;
+                        } else {
+                            let src = if i >= 8 {
+                                &cpu.core.addr
+                            } else {
+                                &cpu.core.data
+                            };
+                            let value = src[i % 8];
+                            cpu.write(addr, value, size);
+                        }
+
+                        addr += size.len() as u32;
+                    }
+                }
+            }
+            AddrMode::AddrPreDecr(reg) => {
+                // Only register-to-memory transfers are allowed in this mode
+                assert_eq!(direction, false);
+
+                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+
+                let reg = reg as usize;
+
+                for i in 0..16 {
+                    if (mask >> i) & 1 != 0 {
+                        cpu.core.addr[reg] =
+                            cpu.core.addr[reg].wrapping_sub(size.len() as u32);
+
+                        if i < 8 {
+                            cpu.write(cpu.core.addr[reg], cpu.core.addr[7 - (i % 8)], size)
+                        } else {
+                            cpu.write(cpu.core.addr[reg], cpu.core.data[7 - (i % 8)], size)
+                        }
+                    }
+                }
+            }
+            AddrMode::AddrPostIncr(reg) => {
+                // Only memory-to-register transfers are allowed in this mode
+                assert_eq!(direction, true);
+
+                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+
+                let reg = reg as usize;
+
+                for i in 0..16 {
+                    if (mask >> i) & 1 != 0 {
+                        let value = cpu.read(cpu.core.addr[reg], size);
+
+                        if i >= 8 {
+                            cpu.core.addr[i % 8] = extend(value);
+                        } else {
+                            cpu.core.data[i % 8] = extend(value);
+                        }
+
+                        cpu.core.addr[reg] =
+                            cpu.core.addr[reg].wrapping_add(size.len() as u32);
+                    }
+                }
+            }
+            AddrMode::Addr(reg) => {
+                let mask = (cpu.read(cpu.core.pc + 2, Size::Word) as u16).swap_bytes();
+
+                // false -> register to memory
+                // true -> memory to register
+
+                let mut addr = cpu.core.addr[reg as usize];
+                for i in 0..16 {
+                    if (mask >> i) & 1 != 0 {
+                        if direction {
+                            let value = cpu.read(addr, size);
+                            let dst = if i >= 8 {
+                                &mut cpu.core.data
+                            } else {
+                                &mut cpu.core.addr
+                            };
+                            dst[i % 8] = value;
+                        } else {
+                            let src = if i >= 8 {
+                                &cpu.core.addr
+                            } else {
+                                &cpu.core.data
+                            };
+                            let value = src[i % 8];
+                            cpu.write(addr, value, size);
+                        }
+
+                        addr = addr.wrapping_add(size.len() as u32);
+                    }
+                }
+            }
+            _ => unimplemented!(
+                "Mode {:?}, direction: {:?}, size: {:?}",
+                mode,
+                direction,
+                size
+            ),
         }
     }
 }
