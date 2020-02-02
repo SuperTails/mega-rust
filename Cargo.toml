@@ -3,6 +3,7 @@ name = "megarust"
 version = "0.1.0"
 authors = ["Carson Swoveland <sciencedude2003@gmail.com>"]
 edition = "2018"
+build = "../build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,3 +14,5 @@ num-derive = "0.3.0"
 bitpat = "0.1.1"
 either = "1.5.3"
 sdl2 = "0.32.2"
+libc = "0.2.66"
+lazy_static = "1.4.0"

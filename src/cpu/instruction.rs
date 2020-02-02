@@ -1,9 +1,13 @@
-use num_traits::FromPrimitive;
-use super::{Cpu, Ccr, LOG_INSTR};
+use super::{Ccr, Cpu, LOG_INSTR};
 use either::Either;
+use num_traits::FromPrimitive;
+pub use pages::*;
 use std::convert::TryFrom;
+use std::fmt;
 
-#[derive(Debug, PartialEq)]
+mod pages;
+
+#[derive(PartialEq)]
 pub enum AddrMode {
     DataReg(u8),
     AddrReg(u8),
@@ -19,6 +23,25 @@ pub enum AddrMode {
     Immediate,
 }
 
+impl fmt::Debug for AddrMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddrMode::DataReg(d) => write!(f, "d{}", d),
+            AddrMode::AddrReg(d) => write!(f, "a{}", d),
+            AddrMode::Immediate => write!(f, "#imm"),
+            AddrMode::AddrPostIncr(d) => write!(f, "(a{})+", d),
+            AddrMode::AddrPreDecr(d) => write!(f, "-(a{})", d),
+            AddrMode::Addr(d) => write!(f, "(a{})", d),
+            AddrMode::PcDisp => write!(f, "pc($disp)"),
+            AddrMode::PcIndex => write!(f, "PC INDEX"),
+            AddrMode::AbsShort => write!(f, "($addr).w"),
+            AddrMode::AbsLong => write!(f, "($addr).l"),
+            AddrMode::AddrDisp(d) => write!(f, "$addr(a{})", d),
+            AddrMode::AddrIndex(d) => write!(f, "$addr(a{}, INDEX REG)", d),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Address {
     DataReg(u8),
@@ -27,37 +50,21 @@ pub enum Address {
 }
 
 impl Address {
-    pub fn read(&self, size: &Size, cpu: &mut Cpu) -> u32 {
-        let mask = match size {
-            Size::Byte => 0xFF,
-            Size::Word => 0xFF_FF,
-            Size::Long => 0xFF_FF_FF_FF,
-        };
-
+    pub fn read(&self, size: Size, cpu: &mut Cpu) -> u32 {
         match self {
-            Address::DataReg(reg) => cpu.core.data[*reg as usize] & mask,
-            Address::AddrReg(reg) => cpu.core.addr[*reg as usize] & mask,
+            Address::DataReg(reg) => DataReg::new(*reg).read_sized(size, cpu),
+            Address::AddrReg(reg) => AddrReg::new(*reg).read_sized(size, cpu),
             Address::Address(addr) => cpu.read(*addr, size),
         }
     }
 
-    pub fn write(&self, value: u32, size: &Size, cpu: &mut Cpu) {
-        let mask = match size {
-            Size::Byte => 0xFF,
-            Size::Word => 0xFF_FF,
-            Size::Long => 0xFF_FF_FF_FF,
-        };
-
+    pub fn write(&self, value: u32, size: Size, cpu: &mut Cpu) {
         match self {
             Address::DataReg(reg) => {
-                let reg = &mut cpu.core.data[*reg as usize];
-                *reg &= !mask;
-                *reg |= value & mask;
+                DataReg::new(*reg).write_sized(value, size, cpu);
             }
             Address::AddrReg(reg) => {
-                let reg = &mut cpu.core.addr[*reg as usize];
-                *reg &= !mask;
-                *reg |= value & mask;
+                AddrReg::new(*reg).write_sized(value, size, cpu);
             }
             Address::Address(addr) => cpu.write(*addr, value, size),
         }
@@ -79,125 +86,152 @@ impl AddrMode {
             4 => AddrMode::AddrPreDecr(field),
             5 => AddrMode::AddrDisp(field),
             6 => AddrMode::AddrIndex(field),
-            7 => {
-                match field {
-                    2 => AddrMode::PcDisp,
-                    3 => AddrMode::PcIndex,
-                    0 => AddrMode::AbsShort,
-                    1 => AddrMode::AbsLong,
-                    4 => AddrMode::Immediate,
-                    _ => panic!()
-                }
-            }
-            _ => unreachable!()
+            7 => match field {
+                2 => AddrMode::PcDisp,
+                3 => AddrMode::PcIndex,
+                0 => AddrMode::AbsShort,
+                1 => AddrMode::AbsLong,
+                4 => AddrMode::Immediate,
+                _ => panic!(),
+            },
+            _ => unreachable!(),
         }
     }
 
-    pub fn address(&self, has_immediate: bool, size: &Size, cpu: &mut Cpu) -> Address {
-        let extra = if has_immediate { (size.len() as u32 + 1) / 2 * 2} else { 0 };
-        match self {
-            AddrMode::AbsLong => {
-                Address::Address(cpu.read(cpu.core.pc + extra + 2, &Size::Long))
-            }
-            AddrMode::AbsShort => {
-                let address = cpu.read(cpu.core.pc + extra + 2, &Size::Word) as i16;
+    // TODO: HOW DOES THIS WORK AT ALL?!
+    // TODO: HOW TO FIND SCALE
+    fn address_index(&self, extra: u32, cpu: &mut Cpu, reg: u32) -> Address {
+        let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
+        let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8;
 
-                if address < 0 {
-                    Address::Address(0xFF_FF_FF_FF - (-address) as u32 + 1)
-                } else {
-                    Address::Address(address as u32)
-                }
+        if LOG_INSTR {
+            print!("Base offset of {:#X} ", offset);
+        }
+
+        // False is data, true is address
+        let reg_type = (index_info >> 7) != 0;
+        let reg_index = (index_info >> 4) & 0x7;
+        let reg_offset = if reg_type {
+            if LOG_INSTR {
+                println!("and using register a{}", reg_index);
+            }
+            cpu.core.addr[reg_index as usize]
+        } else {
+            if LOG_INSTR {
+                println!("and using register d{}", reg_index);
+            }
+            cpu.core.data[reg_index as usize]
+        };
+
+        if index_info & 0x7 != 0 {
+            unimplemented!(
+                "Don't know what the low three bits of {:#b} means",
+                index_info
+            )
+        }
+
+        Address::Address(reg.wrapping_add(reg_offset).wrapping_add(offset as u32))
+    }
+
+    pub fn address(&self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> Address {
+        let extra = if has_immediate {
+            (size.len() as u32 + 1) / 2 * 2
+        } else {
+            0
+        };
+        match self {
+            AddrMode::AbsLong => Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Long)),
+            AddrMode::AbsShort => {
+                Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Word) as i16 as i32 as u32)
             }
             AddrMode::PcDisp => {
                 // TODO: Is the displacement signed?
-                let offset = cpu.read(cpu.core.pc + extra + 2, &Size::Word);
+                let offset = cpu.read(cpu.core.pc + extra + 2, Size::Word);
                 Address::Address(cpu.core.pc + 2 + offset)
             }
-            AddrMode::DataReg(reg) => {
-                Address::DataReg(*reg)
+            AddrMode::PcIndex => self.address_index(extra, cpu, cpu.core.pc + 2),
+            AddrMode::AddrIndex(reg) => {
+                let reg = cpu.core.addr[*reg as usize];
+                self.address_index(extra, cpu, reg)
             }
-            AddrMode::AddrReg(reg) => {
-                Address::AddrReg(*reg)
-            }
-            AddrMode::AddrPreDecr(reg) |
-            AddrMode::AddrPostIncr(reg) |
-            AddrMode::Addr(reg) => {
-                Address::Address(cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize])
+            AddrMode::DataReg(reg) => Address::DataReg(*reg),
+            AddrMode::AddrReg(reg) => Address::AddrReg(*reg),
+            AddrMode::AddrPreDecr(reg) | AddrMode::AddrPostIncr(reg) | AddrMode::Addr(reg) => {
+                Address::Address(cpu.core.addr[*reg as usize])
             }
             AddrMode::AddrDisp(reg) => {
-                let offset = cpu.read(cpu.core.pc + 2 + extra, &Size::Word) as i16;
-                let reg = cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize];
+                let offset = cpu.read(cpu.core.pc + 2 + extra, Size::Word) as i16 as i32 as u32;
+                let reg = cpu.core.addr[*reg as usize];
 
-                let address = if offset < 0 {
-                    reg.wrapping_sub((-offset) as u32)
-                } else {
-                    reg.wrapping_add(offset as u32)
-                };
+                let address = reg.wrapping_add(offset);
 
-                // TODO: Can I just cast as i32
                 Address::Address(address)
             }
-            AddrMode::Immediate => {
-                Address::Address(cpu.core.pc + 2 + extra)
-            }
-            _ => unimplemented!("Mode: {:?}", self)
+            AddrMode::Immediate => Address::Address(cpu.core.pc + 2 + extra),
         }
     }
-    
-    pub fn read(&self, has_immediate: bool, size: &Size, cpu: &mut Cpu) -> u32 {
+
+    pub fn read(&self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> u32 {
         if let AddrMode::AddrPreDecr(reg) = self {
-            let reg = &mut cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize];
+            let reg = &mut cpu.core.addr[*reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
         }
         let address = self.address(has_immediate, size, cpu);
         if let AddrMode::AddrPostIncr(reg) = self {
-            cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize] += size.len() as u32;
+            let reg = &mut cpu.core.addr[*reg as usize];
+            *reg = reg.wrapping_add(size.len() as u32);
         }
         address.read(size, cpu)
     }
 
-    pub fn write(&self, value: u32, has_immediate: bool, size: &Size, cpu: &mut Cpu) {
+    pub fn write(&self, value: u32, has_immediate: bool, size: Size, cpu: &mut Cpu) {
         if let AddrMode::AddrPreDecr(reg) = self {
-            let reg = &mut cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize];
+            let reg = &mut cpu.core.addr[*reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
         }
         let address = self.address(has_immediate, size, cpu);
         if let AddrMode::AddrPostIncr(reg) = self {
-            let reg = &mut cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize];
+            let reg = &mut cpu.core.addr[*reg as usize];
             *reg = reg.wrapping_add(size.len() as u32);
         }
         address.write(value, size, cpu)
     }
 
-    pub fn arg_length(&self, size: &Size) -> u32 {
+    pub fn arg_length(&self, size: Size) -> u32 {
         match self {
-            AddrMode::Immediate => if size == &Size::Long { 4 } else { 2 }
+            AddrMode::Immediate => {
+                if size == Size::Long {
+                    4
+                } else {
+                    2
+                }
+            }
 
-            AddrMode::DataReg(_) |
-            AddrMode::AddrReg(_) |
-            AddrMode::AddrPreDecr(_) |
-            AddrMode::AddrPostIncr(_) |
-            AddrMode::Addr(_) => 0,
+            AddrMode::DataReg(_)
+            | AddrMode::AddrReg(_)
+            | AddrMode::AddrPreDecr(_)
+            | AddrMode::AddrPostIncr(_)
+            | AddrMode::Addr(_) => 0,
 
             AddrMode::AbsLong => 4,
 
-            AddrMode::AbsShort | 
-            AddrMode::PcDisp |
-            AddrMode::AddrDisp(_) => 2,
-            _ => unimplemented!("mode: {:?}", self)
+            // TODO: Number of extension words can vary?!
+            AddrMode::PcIndex | AddrMode::AddrIndex(_) => 2,
+
+            AddrMode::AbsShort | AddrMode::PcDisp | AddrMode::AddrDisp(_) => 2,
         }
     }
 }
 
 #[derive(Debug, FromPrimitive, PartialEq)]
 pub enum Condition {
-    True   = 0b0000,
-    False  = 0b0001,
+    True = 0b0000,
+    False = 0b0001,
     Higher = 0b0010,
-    LowerOrSame,
-    CarryClear,
-    CarrySet,
-    NotEqual,
+    LowerOrSame = 0b0011,
+    CarryClear = 0b0100,
+    CarrySet = 0b0101,
+    NotEqual = 0b0110,
     Equal,
     OverflowClear,
     OverflowSet,
@@ -206,11 +240,34 @@ pub enum Condition {
     GreaterOrEqual,
     LessThan,
     GreaterThan,
-    LessOrEqual
+    LessOrEqual,
 }
 
 impl Condition {
-    pub fn check(&self, ccr: &Ccr) -> bool {
+    fn short_name(&self) -> &'static str {
+        match self {
+            Condition::True => "ra",
+            Condition::False => "sr",
+            Condition::Higher => "hi",
+            Condition::LowerOrSame => "ls",
+            Condition::CarryClear => "cc",
+            Condition::CarrySet => "cs",
+            Condition::NotEqual => "ne",
+            Condition::Equal => "eq",
+            Condition::OverflowClear => "vc",
+            Condition::OverflowSet => "vs",
+            Condition::Plus => "pl",
+            Condition::Minus => "mi",
+            Condition::GreaterOrEqual => "ge",
+            Condition::LessThan => "lt",
+            Condition::GreaterThan => "gt",
+            Condition::LessOrEqual => "le",
+        }
+    }
+}
+
+impl Condition {
+    pub fn check(&self, ccr: Ccr) -> bool {
         match self {
             Condition::True => true,
             Condition::False => false,
@@ -224,10 +281,21 @@ impl Condition {
             Condition::OverflowSet => ccr.overflow(),
             Condition::Plus => !ccr.negative(),
             Condition::Minus => ccr.negative(),
-            Condition::GreaterOrEqual => (ccr.negative() && ccr.overflow()) || (!ccr.negative() && !ccr.overflow()),
-            Condition::LessThan => (ccr.negative() && !ccr.overflow()) || (!ccr.negative() && ccr.overflow()),
-            Condition::GreaterThan => (ccr.negative() && ccr.overflow() && ccr.zero()) || (!ccr.negative() && !ccr.overflow() && !ccr.zero()),
-            Condition::LessOrEqual => ccr.zero() || (ccr.negative() && !ccr.overflow()) || (!ccr.negative() && ccr.overflow()),
+            Condition::GreaterOrEqual => {
+                (ccr.negative() && ccr.overflow()) || (!ccr.negative() && !ccr.overflow())
+            }
+            Condition::LessThan => {
+                (ccr.negative() && !ccr.overflow()) || (!ccr.negative() && ccr.overflow())
+            }
+            Condition::GreaterThan => {
+                (ccr.negative() && ccr.overflow() && ccr.zero())
+                    || (!ccr.negative() && !ccr.overflow() && !ccr.zero())
+            }
+            Condition::LessOrEqual => {
+                ccr.zero()
+                    || (ccr.negative() && !ccr.overflow())
+                    || (!ccr.negative() && ccr.overflow())
+            }
         }
     }
 }
@@ -240,6 +308,14 @@ pub enum Size {
 }
 
 impl Size {
+    pub fn negative_sized(self, value: u32) -> bool {
+        match self {
+            Size::Byte => (value as i8) < 0,
+            Size::Word => (value as i16) < 0,
+            Size::Long => (value as i32) < 0,
+        }
+    }
+
     pub fn normal(data: u8) -> Size {
         match data {
             0 => Size::Byte,
@@ -249,10 +325,27 @@ impl Size {
         }
     }
 
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Size::Byte => "b",
+            Size::Word => "w",
+            Size::Long => "l",
+        }
+    }
+
+    pub fn mask(self) -> u32 {
+        match self {
+            Size::Byte => 0xFF,
+            Size::Word => 0xFF_FF,
+            Size::Long => 0xFF_FF_FF_FF,
+        }
+    }
+
     pub fn single_bit(data: bool) -> Size {
-        match data {
-            false => Size::Word,
-            true  => Size::Long,
+        if data {
+            Size::Word
+        } else {
+            Size::Long
         }
     }
 
@@ -265,7 +358,7 @@ impl Size {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(self) -> usize {
         match self {
             Size::Byte => 1,
             Size::Word => 2,
@@ -273,19 +366,13 @@ impl Size {
         }
     }
 
-    pub fn alignment(&self) -> usize {
+    pub fn alignment(self) -> usize {
         match self {
             Size::Byte => 1,
             Size::Word => 2,
             Size::Long => 2,
         }
     }
-}
-
-trait Instr: TryFrom<u16> {
-    fn size(&self) -> u32;
-
-    fn execute(&self, cpu: &mut Cpu);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -297,12 +384,25 @@ impl DataReg {
         DataReg(reg)
     }
 
-    pub fn read(&self, cpu: &Cpu) -> u32 {
+    pub fn read(self, cpu: &Cpu) -> u32 {
         cpu.core.data[self.0 as usize]
     }
 
-    pub fn write(&self, value: u32, cpu: &mut Cpu) {
+    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
+        cpu.core.data[self.0 as usize] & size.mask()
+    }
+
+    pub fn write(self, value: u32, cpu: &mut Cpu) {
         cpu.core.data[self.0 as usize] = value;
+    }
+
+    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
+        cpu.core.data[self.0 as usize] &= !size.mask();
+        cpu.core.data[self.0 as usize] |= value & size.mask();
+    }
+
+    pub fn into_inner(self) -> u8 {
+        self.0
     }
 }
 
@@ -321,12 +421,25 @@ impl AddrReg {
         AddrReg(reg)
     }
 
-    pub fn read(&self, cpu: &Cpu) -> u32 {
-        cpu.core.data[self.0 as usize]
+    pub fn read(self, cpu: &Cpu) -> u32 {
+        cpu.core.addr[self.0 as usize]
     }
 
-    pub fn write(&self, value: u32, cpu: &mut Cpu) {
-        cpu.core.data[self.0 as usize] = value;
+    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
+        cpu.core.addr[self.0 as usize] & size.mask()
+    }
+
+    pub fn write(self, value: u32, cpu: &mut Cpu) {
+        cpu.core.addr[self.0 as usize] = value;
+    }
+
+    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
+        cpu.core.addr[self.0 as usize] &= !size.mask();
+        cpu.core.addr[self.0 as usize] |= value & size.mask();
+    }
+
+    pub fn into_inner(self) -> u8 {
+        self.0
     }
 }
 
@@ -338,7 +451,7 @@ impl Into<u8> for AddrReg {
 
 #[derive(Debug, FromPrimitive)]
 pub enum SimpleOp {
-    Or  = 0b000,
+    Or = 0b000,
     And = 0b001,
     Sub = 0b010,
     Add = 0b011,
@@ -347,39 +460,50 @@ pub enum SimpleOp {
 }
 
 impl SimpleOp {
-    pub fn apply(&self, mut original: u32, arg: u32, size: &Size, mut old_ccr: Ccr) -> (u32, Ccr) { 
-        let mask = match size {
-            Size::Byte => 0xFF,
-            Size::Word => 0xFF_FF,
-            Size::Long => 0xFF_FF_FF_FF,
-        };
+    pub fn name(&self) -> &'static str {
+        match self {
+            SimpleOp::Or => "ori",
+            SimpleOp::And => "andi",
+            SimpleOp::Sub => "subi",
+            SimpleOp::Add => "addi",
+            SimpleOp::Eor => "eori",
+            SimpleOp::Cmp => "cmpi",
+        }
+    }
+
+    pub fn apply(&self, mut original: u32, arg: u32, size: Size, mut old_ccr: Ccr) -> (u32, Ccr) {
+        let mask = size.mask();
 
         let result = match self {
             SimpleOp::Or => original | arg,
-            SimpleOp::And => original & arg, 
+            SimpleOp::And => original & arg,
             SimpleOp::Eor => original ^ arg,
+            SimpleOp::Add => original.wrapping_add(arg),
+            SimpleOp::Sub => original.wrapping_sub(arg),
             SimpleOp::Cmp => original,
-            _ => unimplemented!("Op: {:?}", self)
         };
 
         original &= !mask;
         original |= result & mask;
 
-        if let SimpleOp::Cmp = self {
-            old_ccr = compare(original, arg, size);
-        } else {
-            old_ccr.set_overflow(false);
-            old_ccr.set_carry(false);
-            old_ccr.set_zero(result & mask == 0);
-            old_ccr.set_negative({
-                let value = result & mask;
-                match size {
-                    Size::Byte => (value as i8) < 0,
-                    Size::Word => (value as i16) < 0,
-                    Size::Long => (value as i32) < 0,
-                }
-            });
-        }
+        let new_ccr = match self {
+            SimpleOp::Sub | SimpleOp::Cmp => compare(original, arg, size, false),
+            SimpleOp::Add => compare(original, arg, size, true),
+            _ => {
+                let mut ccr = Ccr(0);
+                ccr.set_overflow(false);
+                ccr.set_carry(false);
+                ccr.set_zero(result & mask == 0);
+                ccr.set_negative_sized(result, size);
+                ccr
+            }
+        };
+
+        // Notice that this does *not* change the extend bit
+        old_ccr.set_overflow(new_ccr.overflow());
+        old_ccr.set_carry(new_ccr.carry());
+        old_ccr.set_zero(new_ccr.zero());
+        old_ccr.set_negative(new_ccr.negative());
 
         (original, old_ccr)
     }
@@ -390,331 +514,524 @@ pub enum BitOpType {
     Test = 0,
     Change,
     Clear,
-    Set
+    Set,
 }
 
-#[derive(Debug)]
-pub struct ImmediatesBits {
-    pub mode: AddrMode,
-
-    // Left: Simple arithmetic operation
-    // (ORI, ANDI, SUBI, EORI, CMPI)
-    //
-    // Right: Bit test/operation
-    // (BTST, BCHG, BCLR, BSET)
-    // If the register is Some, then it specifies the bit number to use
-    // Otherwise, the bit number to use is specified in an immediate argument
-    pub data: Either<(Size, SimpleOp), (Option<DataReg>, BitOpType)>,
-}
-
-impl Instr for ImmediatesBits {
-    fn size(&self) -> u32 {
-        // TODO: Figure out size properly
-        let instr_size = self.data
-            .as_ref()
-            .either(
-                |(size, _)| ((size.len() + 1) / 2) as u32 * 2 + self.mode.arg_length(size),
-                |reg| match reg { 
-                    (Some(_), _) => 0,
-                    (None, _) => AddrMode::Immediate.arg_length(&Size::Byte) + self.mode.arg_length(&Size::Byte),
-                }
-            );
-
-        instr_size + 2
-    }
-    
-    fn execute(&self, cpu: &mut Cpu) {
-        match &self.data {
-            Either::Left((size, op)) => {
-                let arg = cpu.read(cpu.core.pc + 2, size);
-                let mut value = if self.use_ccr() {
-                    unimplemented!()   
-                } else if self.use_sr() {
-                    (cpu.core.sr as u32) << 8 | (cpu.core.ccr.0 as u32)
-                } else {
-                    self.mode.read(false, size, cpu)
-                };
-
-                let (value, ccr) = op.apply(value, arg, size, cpu.core.ccr);
-
-                if self.use_ccr() {
-                    unimplemented!()
-                } else if self.use_sr() {
-                    // TODO: Should this affect the CCR? Should the shift be there?
-                    cpu.core.sr = (value >> 8) as u8;
-                } else {
-                    self.mode.write(value, false, size, cpu);
-                    cpu.core.ccr = ccr;
-                }
-            }
-            Either::Right((reg, op_type)) => {
-                let shift_amount = if let Some(data_reg) = reg {
-                    data_reg.read(cpu)
-                } else {
-                    cpu.read(cpu.core.pc + 2, &Size::Byte)
-                };
-
-                if let AddrMode::DataReg(reg) = self.mode {
-                    let reg = DataReg::new(reg);
-                    let shift_amount = shift_amount % 32;
-                    let bit = 1 << shift_amount;
-                    cpu.core.ccr.set_zero(reg.read(cpu) & bit == 0);
-                    match op_type {
-                        BitOpType::Test => {},
-                        BitOpType::Clear => reg.write(reg.read(cpu) & !bit, cpu),
-                        BitOpType::Set => reg.write(reg.read(cpu) | bit, cpu),
-                        BitOpType::Change => reg.write(reg.read(cpu) ^ bit, cpu)
-                    }
-                } else {
-                    let shift_amount = shift_amount % 8;
-                    let mut value = self.mode.read(false, &Size::Byte, cpu);
-                    let bit = 1 << shift_amount;
-                    cpu.core.ccr.set_zero(value & bit == 0);
-                    match op_type {
-                        BitOpType::Test => {},
-                        BitOpType::Clear => value &= !bit,
-                        BitOpType::Set => value |= bit,
-                        BitOpType::Change => value ^= bit,
-                    }
-                }
-            }
+impl BitOpType {
+    fn short_name(&self) -> &'static str {
+        match self {
+            BitOpType::Test => "tst",
+            BitOpType::Change => "chg",
+            BitOpType::Clear => "clr",
+            BitOpType::Set => "set",
         }
     }
 }
 
-impl TryFrom<u16> for ImmediatesBits {
+pub struct Immediates {
+    pub mode: AddrMode,
+    pub size: Size,
+    pub op: SimpleOp,
+}
+
+impl fmt::Debug for Immediates {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{} #imm,", self.op.name(), self.size.suffix())?;
+        if self.use_sr() {
+            write!(f, "sr")
+        } else if self.use_ccr() {
+            write!(f, "ccr")
+        } else {
+            write!(f, "{:?}", self.mode)
+        }
+    }
+}
+
+impl TryFrom<u16> for Immediates {
     type Error = String;
 
-    fn try_from(data: u16) -> Result<ImmediatesBits, Self::Error> {
-        if data >> 12 != 0 {
-            return Err(format!("Incorrect top nybble {}", data >> 12));
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
+        let mode = AddrMode::new(data as u8 & 0x3F);
+        let size = Size::normal(data as u8 >> 6);
+        let op = SimpleOp::from_u16((data >> 9) & 0x7)
+            .ok_or_else(|| format!("Invalid op type {:#b}", (data >> 9) & 0x7))?;
+
+        Ok(Immediates { mode, size, op })
+    }
+}
+
+impl Immediates {
+    fn use_ccr(&self) -> bool {
+        if let AddrMode::Immediate = &self.mode {
+            self.size == Size::Byte
+        } else {
+            false
+        }
+    }
+
+    fn use_sr(&self) -> bool {
+        if let AddrMode::Immediate = &self.mode {
+            self.size == Size::Word
+        } else {
+            false
+        }
+    }
+
+    fn read(&self, cpu: &mut Cpu) -> u32 {
+        if self.use_ccr() {
+            (cpu.core.ccr.0 as u32)
+        } else if self.use_sr() {
+            (cpu.core.sr as u32) << 8 | (cpu.core.ccr.0 as u32)
+        } else {
+            self.mode.read(true, self.size, cpu)
+        }
+    }
+
+    fn write(&self, value: u32, cpu: &mut Cpu) {
+        if self.use_ccr() {
+            cpu.core.ccr.0 = value as u8;
+        } else if self.use_sr() {
+            cpu.core.sr = (value >> 8) as u8;
+            cpu.core.ccr.0 = value as u8;
+        } else {
+            self.mode.write(value, true, self.size, cpu)
+        }
+    }
+}
+
+impl Instr for Immediates {
+    fn size(&self) -> u32 {
+        2 + AddrMode::Immediate.arg_length(self.size)
+            + if let AddrMode::Immediate = self.mode {
+                // Special mode for interacting with the CCR or the SR
+                0
+            } else {
+                // Any size can be passed because we know the mode is not immediate
+                self.mode.arg_length(Size::Byte)
+            }
+    }
+
+    fn execute(&self, cpu: &mut Cpu) {
+        let value = self.read(cpu);
+
+        let arg = cpu.read(cpu.core.pc + 2, self.size);
+        let (value, ccr) = self.op.apply(value, arg, self.size, cpu.core.ccr);
+
+        self.write(value, cpu);
+        cpu.core.ccr = ccr;
+    }
+}
+
+pub struct BitOperation {
+    mode: AddrMode,
+    data_reg: Option<DataReg>,
+    op_type: BitOpType,
+}
+
+impl fmt::Debug for BitOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "b{} ", self.op_type.short_name())?;
+        if let Some(reg) = self.data_reg {
+            write!(f, "d{},", reg.into_inner())?;
+        } else {
+            write!(f, "#imm,")?;
         }
 
+        write!(f, "{:?}", self.mode)
+    }
+}
+
+impl TryFrom<u16> for BitOperation {
+    type Error = String;
+
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
         let mode = AddrMode::new(data as u8 & 0x3F);
+        let op_type = BitOpType::from_u16((data >> 6) & 0x3)
+            .ok_or_else(|| format!("Invalid op {:?}", (data >> 6) & 0x3))?;
 
-        let is_bitop_reg = (data >> 8) & 1 != 0;
-        let is_bitop_imm = (data >> 9) & 0b111 == 0b100;
-
-        let data = if is_bitop_reg {
-            let reg = DataReg::new((data >> 9) as u8 & 0b111);
-            let op_type = BitOpType::from_u16((data >> 6) & 3).unwrap();
-            Either::Right((Some(reg), op_type))
-        } else if is_bitop_imm {
-            let op_type = BitOpType::from_u16((data >> 6) & 3).unwrap();
-            Either::Right((None, op_type))
+        let has_immediate = (data >> 8) & 1 == 0;
+        let data_reg = if has_immediate {
+            None
         } else {
-            let size = Size::normal((data >> 6) as u8 & 3);
-            let op = (data >> 9) as u8 & 0b111;
-            Either::Left((size, SimpleOp::from_u8(op).unwrap()))
+            Some(DataReg::new((data >> 9) as u8 & 0x7))
         };
 
-        Ok(ImmediatesBits {
+        Ok(BitOperation {
             mode,
-            data,
+            data_reg,
+            op_type,
         })
     }
 }
 
-impl ImmediatesBits {
-    fn use_ccr(&self) -> bool {
-        if self.mode == AddrMode::Immediate {
-            if let Either::Left((size, op)) = &self.data {
-                if size == &Size::Byte {
-                    if let SimpleOp::And | SimpleOp::Or | SimpleOp::Eor = op {
-                        return true;
-                    }
-                }
-            }
+impl BitOperation {
+    fn shift_mod(&self) -> u32 {
+        if let AddrMode::DataReg(_) = self.mode {
+            32
+        } else {
+            8
         }
-
-        false
     }
 
-    fn use_sr(&self) -> bool {
-        if self.mode == AddrMode::Immediate {
-            if let Either::Left((size, op)) = &self.data {
-                if size == &Size::Word {
-                    if let SimpleOp::And | SimpleOp::Or | SimpleOp::Eor = op {
-                        return true;
-                    }
-                }
-            }
+    fn data_size(&self) -> Size {
+        if let AddrMode::DataReg(_) = self.mode {
+            Size::Long
+        } else {
+            Size::Byte
         }
+    }
+}
 
-        false
+impl BitOperation {
+    fn size(&self) -> u32 {
+        let shift_size = if self.data_reg.is_some() { 0 } else { 2 };
+        2 + shift_size + self.mode.arg_length(Size::Byte)
     }
 
+    fn execute(&self, cpu: &mut Cpu) {
+        let shift_amount = if let Some(data_reg) = self.data_reg {
+            data_reg.read(cpu)
+        } else {
+            cpu.read(cpu.core.pc + 2, Size::Byte)
+        };
 
+        let shift_amount = shift_amount % self.shift_mod();
+        let bit = 1 << shift_amount;
+
+        let mut value = self
+            .mode
+            .read(self.data_reg.is_none(), self.data_size(), cpu);
+        cpu.core.ccr.set_zero(value & bit == 0);
+
+        match self.op_type {
+            BitOpType::Test => {}
+            BitOpType::Clear => value &= !bit,
+            BitOpType::Set => value |= bit,
+            BitOpType::Change => value ^= bit,
+        }
+
+        self.mode
+            .write(value, self.data_reg.is_none(), self.data_size(), cpu);
+    }
 }
 
 #[derive(Debug)]
 pub enum Miscellaneous {
-    Illegal,
     // If size is Some, then it's a TST instruction,
     // otherwise it's a TAS instruction
     Test(Option<Size>, AddrMode),
     Lea(AddrReg, AddrMode),
+    Swap(DataReg),
+    Pea(AddrMode),
     // The bool is the direction of the move
     MoveM(bool, Size, AddrMode),
     // The bool is the direction of the move (OPPOSITE of the one for MoveM!)
     MoveUsp(bool, AddrReg),
     MoveToSr(AddrMode),
+    MoveFromSr(AddrMode),
+    MoveToCcr(AddrMode),
     Clear(Size, AddrMode),
-    Return,
-    Nop,
+    Jsr(AddrMode),
+    Not(Size, AddrMode),
+    Jmp(AddrMode),
+    Ext(Size, DataReg),
+    Neg(Size, AddrMode),
+    Link(AddrReg),
+    Unlink(AddrReg),
 }
 
 impl Instr for Miscellaneous {
     fn size(&self) -> u32 {
         match self {
-            Miscellaneous::Illegal => 2,
+            Miscellaneous::Unlink(_) => 2,
+            Miscellaneous::Link(_) => 4,
             Miscellaneous::Test(size, mode) => {
                 // The size only matters for an immediate instruction, and
                 // an immediate addressing mode is not legal for the TAS
                 // instruction, so using *any* default is okay
-                let addr_size = mode.arg_length(size.as_ref().unwrap_or(&Size::Byte));
+                let addr_size = mode.arg_length(*size.as_ref().unwrap_or(&Size::Byte));
 
                 2 + addr_size
             }
-            Miscellaneous::Lea(_, mode) => {
-                let addr_size = mode.arg_length(&Size::Long);
+            Miscellaneous::Neg(size, mode) => 2 + mode.arg_length(*size),
+            Miscellaneous::Ext(_, _) => 2,
+            Miscellaneous::Swap(_) => 2,
+            Miscellaneous::Pea(mode) | Miscellaneous::Lea(_, mode) => {
+                let addr_size = mode.arg_length(Size::Long);
 
                 2 + addr_size
             }
-            Miscellaneous::MoveM(_, _, _) => {
-                4
-            }
-            Miscellaneous::MoveUsp(_, _) => {
-                2
-            }
-            Miscellaneous::MoveToSr(mode) => {
-                2 + mode.arg_length(&Size::Word)
-            }
-            Miscellaneous::Clear(size, mode) => {
-                2 + mode.arg_length(size)
-            }
-            Miscellaneous::Return => {
-                2
-            }
-            Miscellaneous::Nop => {
-                2
-            }
+            Miscellaneous::MoveM(_, size, mode) => 4 + mode.arg_length(*size),
+            Miscellaneous::MoveUsp(_, _) => 2,
+            Miscellaneous::MoveToSr(mode) => 2 + mode.arg_length(Size::Word),
+            Miscellaneous::MoveFromSr(mode) => 2 + mode.arg_length(Size::Word),
+            Miscellaneous::MoveToCcr(mode) => 2 + mode.arg_length(Size::Byte),
+            Miscellaneous::Clear(size, mode) => 2 + mode.arg_length(*size),
+            Miscellaneous::Jsr(mode) => 2 + mode.arg_length(Size::Byte),
+            Miscellaneous::Not(size, mode) => 2 + mode.arg_length(*size),
+            Miscellaneous::Jmp(mode) => 2 + mode.arg_length(Size::Byte),
         }
     }
 
+    // TODO: oh god please no
     fn execute(&self, cpu: &mut Cpu) {
         match self {
-            Miscellaneous::Illegal => panic!("Illegal instruction"),
+            Miscellaneous::Link(reg) => {
+                cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
+                cpu.write(cpu.core.addr[7], reg.read(cpu), Size::Long);
+                reg.write(cpu.core.addr[7], cpu);
+                let disp = cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32 as u32;
+                cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp);
+            }
+            Miscellaneous::Unlink(reg) => {
+                cpu.core.addr[7] = reg.read(cpu);
+                let disp = cpu.read(cpu.core.addr[7], Size::Long);
+                reg.write(disp, cpu);
+                cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
+            }
+            Miscellaneous::Neg(size, mode) => {
+                let mut value = mode.read(false, *size, cpu);
+                cpu.core.ccr = compare(0, value, *size, false);
+                value = 0_u32.wrapping_sub(value);
+                mode.write(value, false, *size, cpu);
+            }
+            Miscellaneous::Swap(reg) => {
+                let value = reg.read(cpu);
+                let result = (value << 16) | (value >> 16);
+                reg.write(result, cpu);
+            }
+            Miscellaneous::Ext(size, reg) => match size {
+                Size::Word => {
+                    let result = reg.read(cpu) as i8 as i16 as u32;
+                    cpu.core.ccr.set_zero(result == 0);
+                    cpu.core.ccr.set_negative_sized(result, Size::Word);
+                    reg.write_sized(result, Size::Word, cpu);
+                }
+                Size::Long => {
+                    let result = reg.read(cpu) as i16 as i32 as u32;
+                    cpu.core.ccr.set_zero(result == 0);
+                    cpu.core.ccr.set_negative_sized(result, Size::Long);
+                    reg.write_sized(result, Size::Long, cpu);
+                }
+                _ => unreachable!(),
+            },
             Miscellaneous::Test(size, mode) => {
                 if let Some(size) = size {
-                    let value = mode.read(false, size, cpu);
+                    let value = mode.read(false, *size, cpu);
                     cpu.core.ccr.set_zero(value == 0);
                     cpu.core.ccr.set_overflow(false);
                     cpu.core.ccr.set_carry(false);
-                    cpu.core.ccr.set_negative(
-                        match size {
-                            Size::Byte => (value as i8) < 0,
-                            Size::Word => (value as i16) < 0,
-                            Size::Long => (value as i32) < 0,
-                        }
-                    )
+                    cpu.core.ccr.set_negative_sized(value, *size);
                 } else {
                     unimplemented!()
                 }
             }
+            Miscellaneous::Jsr(mode) => {
+                let stored = cpu.core.pc + self.size();
+                cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
+                cpu.write(cpu.core.addr[7], stored, Size::Long);
+
+                if LOG_INSTR {
+                    println!("Pushed return address {:#X}", stored)
+                }
+
+                if let Address::Address(dest) = mode.address(false, Size::Byte, cpu) {
+                    cpu.core.pc = dest - self.size();
+                } else {
+                    panic!()
+                }
+            }
+            Miscellaneous::Jmp(mode) => {
+                if let Address::Address(dest) = mode.address(false, Size::Byte, cpu) {
+                    cpu.core.pc = dest - self.size();
+                    if LOG_INSTR {
+                        println!("JMP, PC will be {:#X}", cpu.core.pc + self.size());
+                    }
+                } else {
+                    panic!()
+                }
+            }
             Miscellaneous::Lea(reg, mode) => {
                 // TODO: Make sure this is actually what this instruction does
-                if let Address::Address(address) = mode.address(false, &Size::Long, cpu) {
-                    cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize] = address;
+                if let Address::Address(address) = mode.address(false, Size::Long, cpu) {
+                    if LOG_INSTR {
+                        println!("Lea {:?} = {:#X}", reg, address)
+                    }
+                    reg.write(address, cpu);
+                } else {
+                    panic!()
+                }
+            }
+            Miscellaneous::Pea(mode) => {
+                if let Address::Address(address) = mode.address(false, Size::Long, cpu) {
+                    cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
+                    cpu.write(cpu.core.addr[7], address, Size::Long);
                 } else {
                     panic!()
                 }
             }
             Miscellaneous::Clear(size, addr_mode) => {
-                addr_mode.write(0, false, size, cpu);
+                addr_mode.write(0, false, *size, cpu);
                 cpu.core.ccr.set_negative(false);
                 cpu.core.ccr.set_overflow(false);
                 cpu.core.ccr.set_carry(false);
                 cpu.core.ccr.set_zero(true);
             }
-            Miscellaneous::Nop => {},
-            Miscellaneous::Return => {
-                let new = cpu.read(cpu.core.addr[7], &Size::Long);
-                cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
-
-                cpu.core.pc = new;
-
-                if LOG_INSTR { println!("Returning, PC will be {:#X}", cpu.core.pc + 2) }
-            }
             Miscellaneous::MoveM(direction, size, mode) => {
+                let extend = |val: u32| -> u32 {
+                    match size {
+                        Size::Byte => val as i8 as i32 as u32,
+                        Size::Word => val as i16 as i32 as u32,
+                        Size::Long => val,
+                    }
+                };
+
                 match mode {
+                    AddrMode::AbsLong | AddrMode::AbsShort => {
+                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+
+                        let mut addr =
+                            if let Address::Address(addr) = mode.address(true, Size::Word, cpu) {
+                                addr
+                            } else {
+                                unreachable!()
+                            };
+
+                        for i in 0..16 {
+                            if (mask >> i) & 1 != 0 {
+                                if *direction {
+                                    let value = extend(cpu.read(addr, *size));
+                                    let dst = if i >= 8 {
+                                        &mut cpu.core.addr
+                                    } else {
+                                        &mut cpu.core.data
+                                    };
+                                    dst[i % 8] = value;
+                                } else {
+                                    let src = if i >= 8 {
+                                        &cpu.core.addr
+                                    } else {
+                                        &cpu.core.data
+                                    };
+                                    let value = src[i % 8];
+                                    cpu.write(addr, value, *size);
+                                }
+
+                                addr += size.len() as u32;
+                            }
+                        }
+                    }
+                    AddrMode::AddrPreDecr(reg) => {
+                        // Only register-to-memory transfers are allowed in this mode
+                        assert_eq!(*direction, false);
+
+                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+
+                        let reg = *reg as usize;
+
+                        for i in 0..16 {
+                            if (mask >> i) & 1 != 0 {
+                                cpu.core.addr[reg] =
+                                    cpu.core.addr[reg].wrapping_sub(size.len() as u32);
+
+                                if i < 8 {
+                                    cpu.write(cpu.core.addr[reg], cpu.core.addr[7 - (i % 8)], *size)
+                                } else {
+                                    cpu.write(cpu.core.addr[reg], cpu.core.data[7 - (i % 8)], *size)
+                                }
+                            }
+                        }
+                    }
                     AddrMode::AddrPostIncr(reg) => {
                         // Only memory-to-register transfers are allowed in this mode
                         assert_eq!(*direction, true);
 
-                        // TODO: Is flipping it correct?
-                        let mask = cpu.read(cpu.core.pc + 2, &Size::Word) as u16;
+                        let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
 
-                        let reg = <_ as Into<u8>>::into(*reg) as usize;
+                        let reg = *reg as usize;
 
                         for i in 0..16 {
                             if (mask >> i) & 1 != 0 {
-                                let value = cpu.read(cpu.core.addr[reg], size);
+                                let value = cpu.read(cpu.core.addr[reg], *size);
 
                                 if i >= 8 {
-                                    cpu.core.addr[i - 8] = value;
+                                    cpu.core.addr[i % 8] = extend(value);
                                 } else {
-                                    cpu.core.data[i - 0] = value;
+                                    cpu.core.data[i % 8] = extend(value);
                                 }
 
-                                cpu.core.addr[reg] += size.len() as u32;
+                                cpu.core.addr[reg] =
+                                    cpu.core.addr[reg].wrapping_add(size.len() as u32);
                             }
                         }
                     }
                     AddrMode::Addr(reg) => {
-                        let mask = (cpu.read(cpu.core.pc + 2, &Size::Word) as u16).swap_bytes();
+                        let mask = (cpu.read(cpu.core.pc + 2, Size::Word) as u16).swap_bytes();
 
                         // false -> register to memory
                         // true -> memory to register
-                        
-                        let mut addr = cpu.core.addr[<_ as Into<u8>>::into(*reg) as usize];
+
+                        let mut addr = cpu.core.addr[*reg as usize];
                         for i in 0..16 {
                             if (mask >> i) & 1 != 0 {
                                 if *direction {
-                                    let value = cpu.read(addr, size);
-                                    if i >= 8 {
-                                        cpu.core.addr[i - 8] = value;
+                                    let value = cpu.read(addr, *size);
+                                    let dst = if i >= 8 {
+                                        &mut cpu.core.data
                                     } else {
-                                        cpu.core.data[i - 0] = value;
-                                    }
+                                        &mut cpu.core.addr
+                                    };
+                                    dst[i % 8] = value;
                                 } else {
-                                    if i >= 8 {
-                                        cpu.write(addr, cpu.core.addr[i - 8], size);
+                                    let src = if i >= 8 {
+                                        &cpu.core.addr
                                     } else {
-                                        cpu.write(addr, cpu.core.data[i - 0], size);
-                                    }
+                                        &cpu.core.data
+                                    };
+                                    let value = src[i % 8];
+                                    cpu.write(addr, value, *size);
                                 }
- 
+
                                 addr = addr.wrapping_add(size.len() as u32);
                             }
                         }
                     }
-                    _ => unimplemented!("Mode {:?}", mode)
+                    _ => unimplemented!(
+                        "Mode {:?}, direction: {:?}, size: {:?}",
+                        mode,
+                        direction,
+                        size
+                    ),
                 }
             }
             Miscellaneous::MoveUsp(dir, reg) => {
                 // TODO: Check if these are swapped
-                let reg = <_ as Into<u8>>::into(*reg) as usize;
+                let reg = reg.into_inner() as usize;
                 if *dir {
                     cpu.core.addr[reg] = cpu.core.usp;
                 } else {
                     cpu.core.usp = cpu.core.addr[reg];
                 }
             }
+            Miscellaneous::MoveFromSr(mode) => {
+                let value = (cpu.core.sr as u16) << 8 | cpu.core.ccr.0 as u16;
+                mode.write(value as u32, false, Size::Word, cpu);
+            }
             Miscellaneous::MoveToSr(mode) => {
-                let data = mode.read(false, &Size::Word, cpu);
+                let data = mode.read(false, Size::Word, cpu);
                 cpu.core.sr = (data >> 8) as u8;
                 cpu.core.ccr.0 = data as u8;
+            }
+            Miscellaneous::MoveToCcr(mode) => {
+                cpu.core.ccr.0 = mode.read(false, Size::Word, cpu) as u8;
+            }
+            Miscellaneous::Not(size, mode) => {
+                let result = !mode.read(false, *size, cpu);
+                cpu.core.ccr.set_overflow(false);
+                cpu.core.ccr.set_carry(false);
+                cpu.core.ccr.set_zero(result == 0);
+                cpu.core.ccr.set_negative_sized(result, *size);
+                mode.write(result, false, *size, cpu);
             }
         }
     }
@@ -728,30 +1045,57 @@ impl TryFrom<u16> for Miscellaneous {
             return Err(format!("Invalid top nybble {:#b}", data >> 12));
         }
 
-        let next_nybble = (data >> 8) as u8 & 0b1111;
+        if (data >> 3) & 0b111_111_111 == 0b100_001_000 {
+            return Ok(Miscellaneous::Swap(DataReg::new(data as u8 & 0x7)));
+        }
+
+        if (data >> 3) & 0b111_111_111 == 0b111_001_010 {
+            return Ok(Miscellaneous::Link(AddrReg::new(data as u8 & 0x7)));
+        }
+
+        if (data >> 3) & 0b111_111_111 == 0b111_001_011 {
+            return Ok(Miscellaneous::Unlink(AddrReg::new(data as u8 & 0x7)));
+        }
+
+        let get_mode = || AddrMode::new(data as u8 & 0x3F);
+        match (data >> 6) & 0b111_111 {
+            0b000_011 => return Ok(Miscellaneous::MoveFromSr(get_mode())),
+            0b010_011 => return Ok(Miscellaneous::MoveToCcr(get_mode())),
+            0b011_011 => return Ok(Miscellaneous::MoveToSr(get_mode())),
+            0b100_001 => return Ok(Miscellaneous::Pea(get_mode())),
+            0b111_011 => return Ok(Miscellaneous::Jmp(get_mode())),
+            0b111_010 => return Ok(Miscellaneous::Jsr(get_mode())),
+            _ => {}
+        }
+
         let low_byte = data as u8;
-
+        let next_nybble = (data >> 8) as u8 & 0b1111;
         if next_nybble == 0b1010 {
-            if low_byte == 0b1111_1100 {
-                Ok(Miscellaneous::Illegal)
-            } else {
-                let mode = AddrMode::new(low_byte & 0x3F);
-                let size = low_byte >> 6;
-                let size = if size == 0b11 {
-                    None
-                } else {
-                    Some(Size::normal(size))
-                };
-
-                Ok(Miscellaneous::Test(size, mode))
-            }
-        } else if (data >> 6) & 0b1111_11 == 0b0110_11 {
             let mode = AddrMode::new(low_byte & 0x3F);
-            Ok(Miscellaneous::MoveToSr(mode))
+            let size = low_byte >> 6;
+            let size = if size == 0b11 {
+                None
+            } else {
+                Some(Size::normal(size))
+            };
+
+            Ok(Miscellaneous::Test(size, mode))
+        } else if bitpat!(1 0 0 0 1 _ 0 0 0)(data >> 3) {
+            let size = Size::single_bit((data >> 6) != 0);
+            let reg = DataReg::new(data as u8 & 0x7);
+            Ok(Miscellaneous::Ext(size, reg))
         } else if (data >> 6) & 0b111 == 0b111 {
             let reg = AddrReg::new((data >> 9) as u8 & 0b111);
             let mode = AddrMode::new(low_byte & 0x3F);
             Ok(Miscellaneous::Lea(reg, mode))
+        } else if (data >> 8) & 0b1111 == 0b0100 {
+            let mode = AddrMode::new(low_byte & 0x3F);
+            let size = Size::normal((data >> 6) as u8 & 3);
+            Ok(Miscellaneous::Neg(size, mode))
+        } else if (data >> 8) & 0b1111 == 0b0110 {
+            let mode = AddrMode::new(low_byte & 0x3F);
+            let size = Size::normal((data >> 6) as u8 & 3);
+            Ok(Miscellaneous::Not(size, mode))
         } else if (data >> 7) & 0b111 == 0b001 {
             let direction = (data >> 10) & 1 != 0;
             let size = Size::single_bit((data >> 6) & 1 != 0);
@@ -761,25 +1105,43 @@ impl TryFrom<u16> for Miscellaneous {
             let direction = (data >> 3) & 1 != 0;
             let reg = AddrReg::new(data as u8 & 0x7);
             Ok(Miscellaneous::MoveUsp(direction, reg))
-        } else if data >> 6 == 0b0100_0010_10 {
+        } else if data >> 8 == 0b0100_0010 {
             let size = Size::normal(data as u8 >> 6);
             let mode = AddrMode::new(low_byte & 0x3F);
             Ok(Miscellaneous::Clear(size, mode))
-        } else if data == 0b0100_1110_0111_0101 {
-            Ok(Miscellaneous::Return)
-        } else if data == 0b0100_1110_0111_0001 {
-            Ok(Miscellaneous::Nop)
         } else {
-            unimplemented!("Word: {:#b}", data);
+            unimplemented!(
+                "Word: {:04b} {:04b} {:04b} {:04b}",
+                (data >> 12) & 0xF,
+                (data >> 8) & 0xF,
+                (data >> 4) & 0xF,
+                (data) & 0xF,
+            );
         }
     }
 }
 
-#[derive(Debug)]
 pub struct Branch {
     pub condition: Condition,
-    pub displacement: i32,
-    pub disp_length: usize,
+    pub data: u8,
+}
+
+impl fmt::Debug for Branch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "b{} ", self.condition.short_name())?;
+        match self.data {
+            0x00 => write!(f, "word offset"),
+            0xFF => write!(f, "long offset"),
+            d => {
+                let d = d as i8;
+                if d < 0 {
+                    write!(f, "-{:#X}", -(d as i16))
+                } else {
+                    write!(f, "+{:#X}", d)
+                }
+            }
+        }
+    }
 }
 
 impl TryFrom<u16> for Branch {
@@ -792,59 +1154,91 @@ impl TryFrom<u16> for Branch {
 
         let condition = Condition::from_u16((data >> 8) & 0xF).unwrap();
 
-        // TODO: How do I handle long offsets?
-        let (displacement, disp_length) = if data as i8 != 0 {
-            ((data as i8) as i32, 0)
-        } else {
-            (0, 2)
-        };
-
         Ok(Branch {
             condition,
-            displacement,
-            disp_length,
+            data: data as u8,
         })
+    }
+}
+
+impl Branch {
+    fn disp_length(&self) -> u32 {
+        match self.data {
+            0xFF => 4,
+            0x00 => 2,
+            _ => 0,
+        }
+    }
+
+    fn displacement(&self, cpu: &mut Cpu) -> i32 {
+        match self.data {
+            0xFF => cpu.read(cpu.core.pc + 2, Size::Long) as i32,
+            0x00 => cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32,
+            _ => self.data as i8 as i32,
+        }
     }
 }
 
 impl Instr for Branch {
     fn size(&self) -> u32 {
-        if self.disp_length != 0 {
-            2 + self.disp_length as u32
+        if self.disp_length() != 0 {
+            2 + self.disp_length() as u32
         } else {
             2
         }
     }
 
     fn execute(&self, cpu: &mut Cpu) {
-        let displacement = if self.disp_length != 0 {
-            cpu.read(cpu.core.pc + 2, &Size::Word) as i32 - self.disp_length as i32
-        } else {
-            self.displacement
-        };
+        let displacement = self.displacement(cpu);
 
         if self.condition == Condition::False {
-            // BSR
-            let stored = cpu.core.pc + 2;
             cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
-            cpu.write(cpu.core.addr[7], stored, &Size::Long);
+            cpu.write(cpu.core.addr[7], cpu.core.pc + self.size(), Size::Long);
 
-            cpu.core.pc = cpu.core.pc.wrapping_add(displacement as u32);
+            cpu.core.pc = cpu
+                .core
+                .pc
+                .wrapping_add(displacement.wrapping_add(2) as u32);
 
-            if LOG_INSTR { println!("JSR, PC will be {:#X}", cpu.core.pc + 2); }
-        }
-        else if self.condition.check(&cpu.core.ccr) {
-            cpu.core.pc = cpu.core.pc.wrapping_add(displacement as u32);
-            if LOG_INSTR { println!("Branch taken, PC will be {:#X}", cpu.core.pc + 2); }
+            if LOG_INSTR {
+                println!(
+                    "Branch (to subroutine) taken, PC will be {:#X}",
+                    cpu.core.pc
+                );
+            }
+
+            cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
+        } else if self.condition.check(cpu.core.ccr) {
+            cpu.core.pc = cpu
+                .core
+                .pc
+                .wrapping_add(displacement.wrapping_add(2) as u32);
+            if LOG_INSTR {
+                println!("Branch taken, PC will be {:#X}", cpu.core.pc);
+            }
+
+            // Kind of a hack to cancel out the auto-increment
+            cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
         }
     }
 }
 
-#[derive(Debug)]
 pub struct Move {
     size: Size,
-    to_mode: AddrMode,
     from_mode: AddrMode,
+    to_mode: AddrMode,
+}
+
+impl fmt::Debug for Move {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "move.{} {:?},{:?}",
+            self.size.suffix(),
+            self.from_mode,
+            self.to_mode
+        )
+    }
 }
 
 impl TryFrom<u16> for Move {
@@ -873,32 +1267,49 @@ impl TryFrom<u16> for Move {
 
 impl Instr for Move {
     fn size(&self) -> u32 {
-        2 + self.to_mode.arg_length(&self.size) + self.from_mode.arg_length(&self.size)
+        2 + self.to_mode.arg_length(self.size) + self.from_mode.arg_length(self.size)
     }
 
     fn execute(&self, cpu: &mut Cpu) {
-        let value = self.from_mode.read(false, &self.size, cpu);
+        let value = self.from_mode.read(false, self.size, cpu);
 
-        cpu.core.ccr.set_overflow(false);
-        cpu.core.ccr.set_carry(false);
-        cpu.core.ccr.set_zero(value == 0);
-        cpu.core.ccr.set_negative(
-            match self.size {
-                Size::Byte => (value as i8) < 0,
-                Size::Word => (value as i16) < 0,
-                Size::Long => (value as i32) < 0,
-            }
-        );
+        if let AddrMode::AddrReg(_) = self.to_mode {
+            // Don't set flags for a MOVEA
+        } else {
+            cpu.core.ccr.set_overflow(false);
+            cpu.core.ccr.set_carry(false);
+            cpu.core.ccr.set_zero(value == 0);
+            cpu.core.ccr.set_negative_sized(value, self.size);
+        }
 
-        let has_immediate = if let AddrMode::Immediate = self.from_mode { true } else { false };
-        self.to_mode.write(value, has_immediate, &self.size, cpu);
+        let has_immediate = if let AddrMode::Immediate = self.from_mode {
+            true
+        } else {
+            false
+        };
+
+        if let AddrMode::AddrReg(reg) = self.to_mode {
+            let value_ext = if self.size == Size::Word {
+                value as i16 as i32 as u32
+            } else {
+                value
+            };
+            AddrReg::new(reg).write(value_ext, cpu);
+        } else {
+            self.to_mode.write(value, has_immediate, self.size, cpu);
+        }
     }
 }
 
-#[derive(Debug)]
 pub struct MoveQ {
     pub reg: DataReg,
     pub value: i8,
+}
+
+impl fmt::Debug for MoveQ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "moveq #{},d{}", self.value, self.reg.into_inner())
+    }
 }
 
 impl TryFrom<u16> for MoveQ {
@@ -911,16 +1322,13 @@ impl TryFrom<u16> for MoveQ {
         }
 
         if (data >> 8) & 1 != 0 {
-            return Err(format!("Invalid bit for MOVEQ"));
+            return Err("Invalid bit for MOVEQ".to_string());
         }
 
         let reg = DataReg::new((data >> 9) as u8 & 0x7);
         let value = data as i8;
 
-        Ok(MoveQ {
-            reg,
-            value
-        })
+        Ok(MoveQ { reg, value })
     }
 }
 
@@ -933,25 +1341,52 @@ impl Instr for MoveQ {
         cpu.core.ccr.set_overflow(false);
         cpu.core.ccr.set_carry(false);
         cpu.core.ccr.set_zero(self.value == 0);
+        cpu.core.ccr.set_negative(self.value < 0);
 
-        let new_value = if self.value < 0 {
-            let data = (-self.value) as u32;
-            0xFF_FF_FF_FF - data + 1
-        } else {
-            self.value as u32
-        };
+        let new_value = self.value as i32 as u32;
 
-        cpu.core.ccr.set_negative((self.value as i32) < 0);
-
-        cpu.core.data[<_ as Into<u8>>::into(self.reg) as usize] = new_value;
+        self.reg.write(new_value, cpu);
     }
 }
 
-#[derive(Debug)]
 pub struct LinearOp {
     pub is_add: bool,
     pub size: Size,
     pub op_type: LinearOpType,
+}
+
+impl fmt::Debug for LinearOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_add {
+            write!(f, "add")?;
+        } else {
+            write!(f, "sub")?;
+        }
+
+        match self.op_type {
+            LinearOpType::Normal(_, _, _) => write!(f, "")?,
+            LinearOpType::WithExtend(_) => write!(f, "x")?,
+            LinearOpType::Address(_, _) => write!(f, "a")?,
+        }
+
+        write!(f, ".{} ", self.size.suffix())?;
+
+        match &self.op_type {
+            LinearOpType::Normal(dir, reg, ea) => {
+                if *dir {
+                    write!(f, "d{},{:?}", reg.into_inner(), ea)?;
+                } else {
+                    write!(f, "{:?},d{}", ea, reg.into_inner())?;
+                }
+            }
+            LinearOpType::Address(reg, ea) => {
+                write!(f, "{:?},a{}", ea, reg.into_inner())?;
+            }
+            _ => write!(f, "data: {:?}", self.op_type)?,
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -964,32 +1399,47 @@ pub enum LinearOpType {
     Address(AddrReg, AddrMode),
 }
 
-fn compare(lhs: u32, rhs: u32, size: &Size) -> Ccr {
-    let max_val = match size {
-        Size::Byte => 0xFF,
-        Size::Word => 0xFF_FF,
-        Size::Long => 0xFF_FF_FF_FF,
+fn compare(dst: u32, src: u32, size: Size, is_add: bool) -> Ccr {
+    let masked_dst = dst & size.mask();
+    let masked_src = src & size.mask();
+
+    let result = if is_add {
+        masked_dst.wrapping_add(masked_src)
+    } else {
+        masked_dst.wrapping_sub(masked_src)
+    };
+    let masked_result = result & size.mask();
+
+    let dst_sign = size.negative_sized(dst);
+    let src_sign = size.negative_sized(src);
+    let result_sign = size.negative_sized(result);
+
+    let overflow = if is_add {
+        (src_sign && dst_sign && !result_sign) || (!src_sign && !dst_sign && result_sign)
+    } else {
+        // This is true on either:
+        // Negative - Positive -> Positive
+        // Positive - Negative -> Negative
+        (!src_sign && dst_sign && !result_sign) || (src_sign && !dst_sign && result_sign)
     };
 
-    let lhs = lhs as u64;
-    let rhs = rhs as u64;
+    let carry = if is_add {
+        (src_sign && dst_sign) || (!result_sign && dst_sign) || (src_sign && !result_sign)
+    } else {
+        (src_sign && !dst_sign) || (result_sign && !dst_sign) || (src_sign && result_sign)
+    };
 
-    let result = (lhs & max_val).wrapping_sub(rhs & max_val);
-
-    let carry = result & !max_val != 0;
-
-    // TODO: This may be wrong, and definitely isn't pretty
-    let bits = max_val.count_ones();
-    let left_sign = ((lhs & max_val) >> (bits - 1)) & 1 != 0;
-    let right_sign = ((rhs & max_val) >> (bits - 1)) & 1 != 0;
-    let result_sign = ((result & max_val) >> (bits - 1)) & 1 != 0;
-
-    let overflow = left_sign == right_sign && left_sign != result_sign;
+    if LOG_INSTR {
+        println!(
+            "Compared dst: {:#X} - src {:#X} = {:#X}",
+            dst, src, masked_result
+        );
+    }
 
     let mut ccr = Ccr(0);
     ccr.set_extend(carry);
     ccr.set_carry(carry);
-    ccr.set_zero((result & max_val) == 0);
+    ccr.set_zero(masked_result == 0);
     ccr.set_negative(result_sign);
     ccr.set_overflow(overflow);
 
@@ -997,22 +1447,18 @@ fn compare(lhs: u32, rhs: u32, size: &Size) -> Ccr {
 }
 
 impl LinearOp {
-    pub fn do_op(is_add: bool, lhs: u32, rhs: u32, size: &Size) -> (u32, Ccr) {
-        let max_val = match size {
-            Size::Byte => 0xFF,
-            Size::Word => 0xFF_FF,
-            Size::Long => 0xFF_FF_FF_FF,
-        };
-
+    pub fn do_op(is_add: bool, dst: u32, src: u32, size: Size) -> (u32, Ccr) {
         let result = if is_add {
-            (lhs & max_val).wrapping_add(rhs & max_val)
+            (dst & size.mask()).wrapping_add(src & size.mask())
         } else {
-            (lhs & max_val).wrapping_sub(rhs & max_val)
+            (dst & size.mask()).wrapping_sub(src & size.mask())
         };
 
-        ((lhs & !max_val) | (result & max_val), compare(lhs, rhs, size))
-    }
+        let sized_result = (dst & !size.mask()) | (result & size.mask());
+        let ccr = compare(dst, src, size, is_add);
 
+        (sized_result, ccr)
+    }
 }
 
 impl TryFrom<u16> for LinearOp {
@@ -1069,14 +1515,13 @@ impl TryFrom<u16> for LinearOp {
             })
         }
     }
-
 }
 
 impl Instr for LinearOp {
     fn size(&self) -> u32 {
         2 + match &self.op_type {
-            LinearOpType::Normal(_, _, mode) => mode.arg_length(&self.size),
-            LinearOpType::Address(_, mode) => mode.arg_length(&self.size),
+            LinearOpType::Normal(_, _, mode) => mode.arg_length(self.size),
+            LinearOpType::Address(_, mode) => mode.arg_length(self.size),
             LinearOpType::WithExtend(_) => 0,
         }
     }
@@ -1084,21 +1529,26 @@ impl Instr for LinearOp {
     fn execute(&self, cpu: &mut Cpu) {
         match &self.op_type {
             LinearOpType::Normal(dir, reg, mode) => {
-                let (lhs, rhs) = if *dir {
-                    (mode.read(false, &self.size, cpu), reg.read(cpu))
+                let (dst, src) = if *dir {
+                    (mode.read(false, self.size, cpu), reg.read(cpu))
                 } else {
-                    (reg.read(cpu), mode.read(false, &self.size, cpu))
+                    (reg.read(cpu), mode.read(false, self.size, cpu))
                 };
 
-                let (result, ccr) = LinearOp::do_op(self.is_add, lhs, rhs, &self.size);
+                let (result, ccr) = LinearOp::do_op(self.is_add, dst, src, self.size);
                 cpu.core.ccr = ccr;
 
                 if *dir {
-                    mode.write(result, false, &self.size, cpu)
+                    mode.write(result, false, self.size, cpu)
                 } else {
                     reg.write(result, cpu)
                 }
             }
+            LinearOpType::Address(reg, mode) => reg.write_sized(
+                reg.read(cpu) + mode.read(false, self.size, cpu),
+                self.size,
+                cpu,
+            ),
             _ => unimplemented!("Linear mode {:?}", self.op_type),
         }
     }
@@ -1115,8 +1565,8 @@ pub enum ConditionsQuicks {
 impl Instr for ConditionsQuicks {
     fn size(&self) -> u32 {
         2 + match self {
-            ConditionsQuicks::AddSubQ(_, _, size, mode) => mode.arg_length(size),
-            ConditionsQuicks::Set(_, mode) => mode.arg_length(&Size::Byte),
+            ConditionsQuicks::AddSubQ(_, _, size, mode) => mode.arg_length(*size),
+            ConditionsQuicks::Set(_, mode) => mode.arg_length(Size::Byte),
             ConditionsQuicks::DecBranch(_, _) => 2,
         }
     }
@@ -1124,30 +1574,48 @@ impl Instr for ConditionsQuicks {
     fn execute(&self, cpu: &mut Cpu) {
         match self {
             ConditionsQuicks::AddSubQ(is_sub, data, size, mode) => {
-                let lhs = mode.read(false, size, cpu);
-                let (result, ccr) = LinearOp::do_op(!is_sub, lhs, *data as u32, size);
-                mode.write(result, false, size, cpu);
-                cpu.core.ccr = ccr;
+                let dst = mode.read(false, *size, cpu);
+                let arg = if *data == 0 { 8 } else { *data };
+                let (result, ccr) = LinearOp::do_op(!is_sub, dst, arg as u32, *size);
+                mode.write(result, false, *size, cpu);
+                if let AddrMode::AddrReg(_) = mode {
+                    // Don't set flags
+                } else {
+                    cpu.core.ccr = ccr;
+                }
             }
             ConditionsQuicks::DecBranch(condition, reg) => {
-                if condition.check(&cpu.core.ccr) {
+                if condition.check(cpu.core.ccr) {
                     // Continue
                 } else {
                     let mut low_word = reg.read(cpu) as i16;
                     low_word = low_word.wrapping_sub(1);
-                    reg.write(low_word as u32, cpu);
+                    reg.write_sized(low_word as u32, Size::Word, cpu);
+
+                    if LOG_INSTR {
+                        println!("Reg is now {:#b}", reg.read(cpu));
+                    }
 
                     if low_word != -1 {
-                        let disp = cpu.read(cpu.core.pc + 2, &Size::Word) as i16;
-                        let new_pc = cpu.core.pc as i16 + disp;
+                        let disp = cpu.read(cpu.core.pc + 2, Size::Word) as i16;
+                        let new_pc = (cpu.core.pc as i16 + disp + 2) as u16;
                         cpu.core.pc &= !0xFF_FF;
                         cpu.core.pc |= new_pc as u32;
+
                         // To adjust for the increment after the instruction
-                        cpu.core.pc -= 2;
+                        cpu.core.pc -= self.size();
                     }
                 }
             }
-            _ => unimplemented!("CQ: {:?}", self)
+            ConditionsQuicks::Set(condition, mode) => {
+                let value = if condition.check(cpu.core.ccr) {
+                    0xFF
+                } else {
+                    0x00
+                };
+
+                mode.write(value, false, Size::Byte, cpu);
+            }
         }
     }
 }
@@ -1175,9 +1643,9 @@ impl TryFrom<u16> for ConditionsQuicks {
         } else {
             let size = Size::normal(size);
             let is_sub = (data >> 8) & 1 != 0;
-            let data = (data >> 9) as u8 & 7;
-            let mode = AddrMode::new(data & 0x3F);
-            Ok(ConditionsQuicks::AddSubQ(is_sub, data, size, mode))
+            let value = (data >> 9) as u8 & 7;
+            let mode = AddrMode::new(data as u8 & 0x3F);
+            Ok(ConditionsQuicks::AddSubQ(is_sub, value, size, mode))
         }
     }
 }
@@ -1193,7 +1661,7 @@ pub enum CompareMode {
 #[derive(Debug)]
 pub struct CompareEor {
     pub size: Size,
-    pub data: Either<CompareMode, (DataReg, AddrMode)>
+    pub data: Either<CompareMode, (DataReg, AddrMode)>,
 }
 
 impl TryFrom<u16> for CompareEor {
@@ -1212,39 +1680,27 @@ impl TryFrom<u16> for CompareEor {
             let mode = CompareMode::Memory(dest_reg, source_reg);
             let size = Size::normal((data >> 6) as u8 & 0x7);
             let data = Either::Left(mode);
-            Ok(CompareEor {
-                size,
-                data
-            })
+            Ok(CompareEor { size, data })
         } else if (data >> 6) & 0b11 == 0b11 {
             let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let size = Size::single_bit((data >> 8) & 1 != 0);
             let mode = CompareMode::Address(dest_reg, source_mode);
             let data = Either::Left(mode);
-            Ok(CompareEor {
-                size,
-                data,
-            })
+            Ok(CompareEor { size, data })
         } else if (data >> 8) & 1 == 0 {
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let size = Size::normal((data >> 6) as u8 & 3);
             let mode = CompareMode::Normal(dest_reg, source_mode);
             let data = Either::Left(mode);
-            Ok(CompareEor {
-                size,
-                data,
-            })
+            Ok(CompareEor { size, data })
         } else {
             let size = Size::normal((data >> 6) as u8 & 3);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let data = Either::Right((dest_reg, source_mode));
-            Ok(CompareEor {
-                size,
-                data,
-            })
+            Ok(CompareEor { size, data })
         }
     }
 }
@@ -1252,120 +1708,476 @@ impl TryFrom<u16> for CompareEor {
 impl Instr for CompareEor {
     fn size(&self) -> u32 {
         match &self.data {
-            Either::Left(mode) => {
-                match mode {
-                    CompareMode::Address(_, source_mode) |
-                    CompareMode::Normal(_, source_mode) => 2 + source_mode.arg_length(&self.size),
-                    CompareMode::Memory(_, _) => 2,
+            Either::Left(mode) => match mode {
+                CompareMode::Address(_, source_mode) | CompareMode::Normal(_, source_mode) => {
+                    2 + source_mode.arg_length(self.size)
                 }
-            }
-            Either::Right(_) => {
-                unimplemented!()
-            }
+                CompareMode::Memory(_, _) => 2,
+            },
+            Either::Right((_, mode)) => 2 + mode.arg_length(self.size),
         }
     }
 
     fn execute(&self, cpu: &mut Cpu) {
         match &self.data {
-            Either::Left(mode) => {
-                match mode {
-                    CompareMode::Normal(dest_reg, source_mode) => {
-                        let dest = dest_reg.read(cpu);
-                        let source = source_mode.read(false, &self.size, cpu);
-                        let new_ccr = compare(dest, source, &self.size);
-                        cpu.core.ccr = new_ccr;
+            Either::Left(mode) => match mode {
+                CompareMode::Normal(dest_reg, source_mode) => {
+                    let dest = dest_reg.read(cpu);
+                    let source = source_mode.read(false, self.size, cpu);
+                    let new_ccr = compare(dest, source, self.size, false);
+                    cpu.core.ccr = new_ccr;
+                }
+                _ => unimplemented!(),
+            },
+            Either::Right((reg, mode)) => {
+                let mut value = reg.read(cpu);
+                value ^= mode.read(false, self.size, cpu) & self.size.mask();
+                reg.write(value, cpu);
+
+                cpu.core.ccr.set_zero(value == 0);
+                cpu.core.ccr.set_negative_sized(value, self.size);
+            }
+        }
+    }
+}
+
+#[derive(Debug, FromPrimitive, PartialEq)]
+pub enum ShiftType {
+    Arithmetic = 0b00,
+    Logical = 0b01,
+    RotateExtend = 0b10,
+    Rotate = 0b11,
+}
+
+impl ShiftType {
+    fn prefix(&self) -> &'static str {
+        match self {
+            ShiftType::Arithmetic => "as",
+            ShiftType::Logical => "ls",
+            ShiftType::RotateExtend => "rox",
+            ShiftType::Rotate => "ro",
+        }
+    }
+}
+
+pub struct Shifts {
+    // Right is false, left is true
+    direction: bool,
+    shift_type: ShiftType,
+    data: Either<(Size, Either<u8, DataReg>, DataReg), AddrMode>,
+}
+
+impl fmt::Debug for Shifts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.shift_type.prefix())?;
+        if self.direction {
+            write!(f, "l")?;
+        } else {
+            write!(f, "r")?;
+        }
+
+        write!(f, " {:?}", self.data)
+    }
+}
+
+impl Shifts {
+    // Left is thing being shifted, right is shift amount
+    fn get_args(&self, cpu: &mut Cpu) -> (u32, u32) {
+        match &self.data {
+            Either::Left((_, amount, shiftee)) => {
+                let amount = amount.either(
+                    // Shift count of zero actually represents 8
+                    |val| if val == 0 { 8 } else { val as u32 },
+                    |reg| reg.read(cpu) % 64,
+                );
+                (shiftee.read(cpu), amount)
+            }
+            Either::Right(mode) => (mode.read(false, Size::Word, cpu), 1),
+        }
+    }
+
+    fn get_size(&self) -> Size {
+        if let Either::Left((size, _, _)) = &self.data {
+            *size
+        } else {
+            Size::Word
+        }
+    }
+
+    fn write_back(&self, value: u32, cpu: &mut Cpu) {
+        match &self.data {
+            Either::Left((size, _, shiftee)) => {
+                shiftee.write_sized(value, *size, cpu);
+            }
+            Either::Right(mode) => {
+                mode.write(value, false, Size::Word, cpu);
+            }
+        }
+    }
+}
+
+impl Instr for Shifts {
+    fn size(&self) -> u32 {
+        match &self.data {
+            Either::Left((_, _, _)) => 2,
+            Either::Right(mode) => 2 + mode.arg_length(Size::Word),
+        }
+    }
+
+    fn execute(&self, cpu: &mut Cpu) {
+        let (mut value, amount) = self.get_args(cpu);
+
+        let width = self.get_size().len() * 8;
+        let top_bit_mask = 1 << (width - 1);
+
+        if self.direction {
+            match &self.shift_type {
+                // TODO: These are probably all wrong
+                ShiftType::Logical | ShiftType::Arithmetic => {
+                    if self.direction {
+                        cpu.core.ccr.set_carry(false);
+
+                        let mut overflow_occurred = false;
+                        for _ in 0..amount {
+                            let prev_value = value;
+                            value <<= 1;
+                            let prev_sign = self.get_size().negative_sized(prev_value);
+                            let new_sign = self.get_size().negative_sized(value);
+                            if prev_sign != new_sign {
+                                overflow_occurred = true;
+                            }
+                            cpu.core.ccr.set_carry(prev_sign);
+                            cpu.core.ccr.set_extend(prev_sign);
+                        }
+
+                        let new_overflow = if self.shift_type == ShiftType::Arithmetic {
+                            overflow_occurred
+                        } else {
+                            false
+                        };
+
+                        cpu.core.ccr.set_overflow(new_overflow);
+                    } else {
+                        unimplemented!()
                     }
-                    _ => unimplemented!()
+                }
+                ShiftType::Rotate => {
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_overflow(false);
+
+                    for _ in 0..amount {
+                        let msb = value & top_bit_mask != 0;
+                        let bottom_bit = msb as u32;
+                        value <<= 1;
+                        value |= bottom_bit;
+                        cpu.core.ccr.set_carry(msb);
+                    }
+                }
+                ShiftType::RotateExtend => {
+                    cpu.core.ccr.set_overflow(false);
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_extend(false);
+
+                    for _ in 0..amount {
+                        let new_bit = (top_bit_mask & value) != 0;
+
+                        value <<= 1;
+                        value |= cpu.core.ccr.extend() as u32;
+
+                        cpu.core.ccr.set_carry(new_bit);
+                        cpu.core.ccr.set_extend(new_bit);
+                    }
                 }
             }
-            Either::Right(_) => unimplemented!()
+        } else {
+            match &self.shift_type {
+                ShiftType::Logical => {
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_overflow(false);
+
+                    for _ in 0..amount {
+                        let lsb = value & 1 != 0;
+                        value = (value & self.get_size().mask()) >> 1;
+                        cpu.core.ccr.set_carry(lsb);
+                        cpu.core.ccr.set_extend(lsb);
+                    }
+                }
+                ShiftType::Rotate => {
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_overflow(false);
+
+                    for _ in 0..amount {
+                        let lsb = value & 1 != 0;
+                        let top_bit = top_bit_mask * (lsb as u32);
+                        value >>= 1;
+                        value &= !top_bit_mask;
+                        value |= top_bit;
+                        cpu.core.ccr.set_carry(lsb);
+                    }
+                }
+                a => unimplemented!("Shift right {:?}", a),
+            }
         }
+
+        cpu.core.ccr.set_zero(value & self.get_size().mask() == 0);
+        cpu.core.ccr.set_negative_sized(value, self.get_size());
+
+        self.write_back(value, cpu);
     }
 }
 
-/// Instructions on the 68k can be roughly divided into 'pages'
-/// based on the high nybble of their encoding. 
-#[derive(Debug)]
-pub enum Pages {
-    ImmediatesBits(ImmediatesBits), // 0b0000
-    Move(Move), // 0b0001, 0b0010, 0b0011
-    Miscellaneous(Miscellaneous), // 0b0100
-    ConditionsQuicks(ConditionsQuicks), // 0b0101
-    Branch(Branch), // 0b0110
-    MoveQ(MoveQ), // 0b0111
-    CompareEor(CompareEor), // 0b1011
-    // 0b1001 means it's a subtraction,
-    // 0b1101 means it's an addition
-    LinearOp(LinearOp),
-}
-
-impl TryFrom<u16> for Pages {
+impl TryFrom<u16> for Shifts {
     type Error = String;
 
-    fn try_from(word: u16) -> Result<Pages, Self::Error> {
-        let page = word >> 12;
-        match page {
-            0b0000 => Ok(Pages::ImmediatesBits(ImmediatesBits::try_from(word).unwrap())),
-            0b0001 |
-            0b0010 |
-            0b0011 => Ok(Pages::Move(Move::try_from(word).unwrap())),
-            0b0100 => Ok(Pages::Miscellaneous(Miscellaneous::try_from(word).unwrap())),
-            0b0101 => Ok(Pages::ConditionsQuicks(ConditionsQuicks::try_from(word).unwrap())),
-            0b0110 => Ok(Pages::Branch(Branch::try_from(word).unwrap())),
-            0b0111 => Ok(Pages::MoveQ(MoveQ::try_from(word).unwrap())),
-            0b1011 => Ok(Pages::CompareEor(CompareEor::try_from(word).unwrap())),
-            0b1001 |
-            0b1101 => Ok(Pages::LinearOp(LinearOp::try_from(word).unwrap())),
-            0b10000..=std::u16::MAX => unreachable!(),
-            _ => unimplemented!("Top nybble: {:#b}, Word: {:#06X}", page, word),
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
+        let top_nybble = data >> 12;
+        if top_nybble != 0b1110 {
+            return Err(format!("Invalid top nybble {:#b}", top_nybble));
+        }
+
+        let direction = data & (1 << 8) != 0;
+        let raw_size = (data >> 6) as u8 & 0b11;
+
+        if raw_size == 0b11 {
+            let mode = AddrMode::new(data as u8 & 0x3F);
+            let shift_type = ShiftType::from_u16((data >> 9) & 0b111).unwrap();
+
+            let data = Either::Right(mode);
+
+            Ok(Shifts {
+                direction,
+                shift_type,
+                data,
+            })
+        } else {
+            let size = Size::normal(raw_size);
+
+            let source = (data >> 9) as u8 & 0x7;
+            let source = if data & (1 << 5) != 0 {
+                // Source is a register
+                Either::Right(DataReg::new(source))
+            } else {
+                Either::Left(source)
+            };
+
+            let data_reg = DataReg::new(data as u8 & 0x7);
+            let shift_type = ShiftType::from_u16((data >> 3) & 0b11).unwrap();
+
+            let data = Either::Left((size, source, data_reg));
+
+            Ok(Shifts {
+                direction,
+                shift_type,
+                data,
+            })
         }
     }
 }
 
-// TODO: Use actual deferring
-impl Instr for Pages {
+// TODO: Implement these
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum DivSubdOr {
+    // True means signed
+    Div(DataReg, bool, AddrMode),
+    Subd(u8, AddrMode),
+    // False means Dn | <ea> -> Dn
+    // True means <ea> | Dn -> <ea>
+    Or(DataReg, bool, Size, AddrMode),
+}
+
+impl TryFrom<u16> for DivSubdOr {
+    type Error = String;
+
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
+        let top_nybble = data >> 12;
+        if top_nybble != 0b1000 {
+            return Err(format!("Invalid top nybble {:#b}", top_nybble));
+        }
+
+        if (data >> 4) & 0x1F == 0b1_00_00 {
+            unimplemented!("Subd")
+        } else if (data >> 6) & 0x3 == 0b11 {
+            unimplemented!("Divu, Divs")
+        } else {
+            let data_reg = DataReg::new((data >> 9) as u8 & 0x7);
+            let direction = (data >> 8) & 1 != 0;
+            let size = Size::normal((data >> 6) as u8 & 0x3);
+            let mode = AddrMode::new(data as u8 & 0x3F);
+
+            Ok(DivSubdOr::Or(data_reg, direction, size, mode))
+        }
+    }
+}
+
+impl Instr for DivSubdOr {
     fn size(&self) -> u32 {
         match self {
-            Pages::ImmediatesBits(a) => a.size(),
-            Pages::Miscellaneous(a) => a.size(),
-            Pages::Branch(a) => a.size(),
-            Pages::Move(a) => a.size(),
-            Pages::MoveQ(a) => a.size(),
-            Pages::LinearOp(a) => a.size(),
-            Pages::ConditionsQuicks(a) => a.size(),
-            Pages::CompareEor(a) => a.size(),
+            DivSubdOr::Div(_, _, mode) => 2 + mode.arg_length(Size::Word),
+            DivSubdOr::Subd(_, mode) => 2 + mode.arg_length(Size::Byte),
+            DivSubdOr::Or(_, _, size, mode) => 2 + mode.arg_length(*size),
         }
     }
 
     fn execute(&self, cpu: &mut Cpu) {
         match self {
-            Pages::ImmediatesBits(a) => a.execute(cpu),
-            Pages::Miscellaneous(a) => a.execute(cpu),
-            Pages::Branch(a) => a.execute(cpu),
-            Pages::Move(a) => a.execute(cpu),
-            Pages::MoveQ(a) => a.execute(cpu),
-            Pages::LinearOp(a) => a.execute(cpu),
-            Pages::ConditionsQuicks(a) => a.execute(cpu),
-            Pages::CompareEor(a) => a.execute(cpu),
+            DivSubdOr::Div(_, _, _) => unimplemented!(),
+            DivSubdOr::Subd(_, _) => unimplemented!(),
+            DivSubdOr::Or(data_reg, direction, size, mode) => {
+                let arg = mode.read(false, *size, cpu);
+                let result = data_reg.read(cpu) | arg;
+
+                cpu.core.ccr.set_negative_sized(result, *size);
+                cpu.core.ccr.set_zero(result == 0);
+                cpu.core.ccr.set_overflow(false);
+                cpu.core.ccr.set_carry(false);
+
+                if *direction {
+                    mode.write(result, false, *size, cpu);
+                } else {
+                    let mask = size.mask();
+                    data_reg.write((result & mask) | (data_reg.read(cpu) & !mask), cpu);
+                }
+            }
         }
     }
 }
 
+// TODO: Implement these
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum MulAddExgAnd {
+    // True means signed
+    Mul(bool, DataReg, AddrMode),
+    Abcd,
+    Exchange,
+    And(DataReg, bool, Size, AddrMode),
+}
+
+impl TryFrom<u16> for MulAddExgAnd {
+    type Error = String;
+
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
+        let top_nybble = data >> 12;
+        if top_nybble != 0b1100 {
+            return Err(format!("Invalid top nybble {:#b}", top_nybble));
+        }
+
+        if (data >> 4) & 0x1F == 0b1_00_00 {
+            unimplemented!("Abcd")
+        } else if (data >> 6) & 0x3 == 0b11 {
+            unimplemented!("Mulu and Muls")
+        } else if bitpat!(1 _ _ 0 0)(data >> 4) {
+            unimplemented!("Exchange")
+        } else {
+            let data_reg = DataReg::new((data >> 9) as u8 & 0x7);
+            let direction = (data >> 8) & 1 != 0;
+            let size = Size::normal((data >> 6) as u8 & 0x3);
+            let mode = AddrMode::new(data as u8 & 0x3F);
+
+            Ok(MulAddExgAnd::And(data_reg, direction, size, mode))
+        }
+    }
+}
+
+impl Instr for MulAddExgAnd {
+    fn size(&self) -> u32 {
+        match self {
+            MulAddExgAnd::And(_, _, size, mode) => 2 + mode.arg_length(*size),
+            _ => unimplemented!(),
+        }
+    }
+
+    fn execute(&self, cpu: &mut Cpu) {
+        match self {
+            MulAddExgAnd::And(data_reg, direction, size, mode) => {
+                let arg = mode.read(false, *size, cpu);
+                let result = data_reg.read(cpu) & arg;
+
+                cpu.core.ccr.set_negative_sized(result, *size);
+                cpu.core.ccr.set_zero(result == 0);
+                cpu.core.ccr.set_overflow(false);
+                cpu.core.ccr.set_carry(false);
+
+                if *direction {
+                    mode.write(result, false, *size, cpu);
+                } else {
+                    let mask = size.mask();
+                    data_reg.write((result & mask) | (data_reg.read(cpu) & !mask), cpu);
+                }
+            }
+            _ => unimplemented!(),
+        }
+    }
+}
+
+macro_rules! standalone_operation {
+    ($name:ident, fn $func_name:ident (&$self_name:ident, $cpu_name:ident : &mut Cpu) $body:block) => {
+        #[derive(Debug)]
+        pub struct $name;
+
+        impl pages::Instr for $name {
+            fn size(&self) -> u32 {
+                2
+            }
+
+            fn $func_name(&$self_name, $cpu_name : &mut Cpu) {
+                $body
+            }
+        }
+    }
+}
+
+standalone_operation!(Illegal, fn execute(&self, _cpu: &mut Cpu) { panic!("Encountered illegal opcode") });
+standalone_operation!(Reset,   fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Reset") });
+standalone_operation!(Nop,     fn execute(&self, _cpu: &mut Cpu) { });
+standalone_operation!(Stop,    fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Stop") });
+standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) { 
+    let new_sr = cpu.read(cpu.core.addr[7], Size::Word) as u16;
+    cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(2);
+    let new_pc = cpu.read(cpu.core.addr[7], Size::Long);
+    cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
+
+    cpu.core.pc = new_pc;
+    cpu.core.sr    = (new_sr >> 8) as u8;
+    cpu.core.ccr.0 = (new_sr     ) as u8;
+
+    if LOG_INSTR { println!("Return from exception, PC will be {:#X}", cpu.core.pc) }
+
+    cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
+});
+
+standalone_operation!(Return, fn execute(&self, cpu: &mut Cpu) {
+    let new = cpu.read(cpu.core.addr[7], Size::Long);
+    cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
+
+    cpu.core.pc = new;
+
+    if LOG_INSTR { println!("Returning, PC will be {:#X}", cpu.core.pc) }
+
+    cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
+});
+standalone_operation!(TrapOverflow, fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Trap overflow") });
+standalone_operation!(RestoreReturn, fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Restore return") });
+
+/// Instructions on the 68k can be roughly divided into 'pages'
+/// based on the high nybble of their encoding.
+
 #[derive(Debug)]
 pub struct Instruction {
-    opcode: Pages
+    pub opcode: Pages,
 }
 
 impl Instruction {
     pub fn new(word: u16) -> Instruction {
         Instruction {
-            opcode: Pages::try_from(word).unwrap()
+            opcode: Pages::try_from(word).unwrap(),
         }
     }
 
     pub fn execute(&self, cpu: &mut Cpu) {
         self.opcode.execute(cpu);
 
-        cpu.core.pc += self.opcode.size();
+        cpu.core.pc = cpu.core.pc.wrapping_add(self.opcode.size());
     }
 }

@@ -27,13 +27,7 @@ impl SDLSystem {
         }
     }
 
-    pub fn present(&mut self) {
-        self.canvas.present();
-    }
-
     pub fn canvas(&mut self) -> &mut WindowCanvas {
         &mut self.canvas
     }
 }
-
-
