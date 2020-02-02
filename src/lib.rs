@@ -1,15 +1,3 @@
-// TODO: Remove these
-#[macro_use]
-extern crate bitfield;
-#[macro_use]
-extern crate bitpat;
-#[macro_use]
-extern crate num_derive;
-extern crate either;
-extern crate libc;
-extern crate num_traits;
-extern crate sdl2;
-
 pub mod cart;
 mod cpu;
 mod joypad;

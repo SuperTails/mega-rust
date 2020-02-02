@@ -6,6 +6,8 @@ use crate::Interrupt;
 use instruction::{Instruction, Size};
 use std::io::Write;
 use std::sync::{Mutex, Weak};
+use std::fmt;
+use bitfield::bitfield;
 
 const LOG_INSTR: bool = true;
 
@@ -24,6 +26,17 @@ bitfield! {
 impl Ccr {
     pub fn set_negative_sized(&mut self, value: u32, size: Size) {
         self.set_negative(size.negative_sized(value))
+    }
+}
+
+impl fmt::Display for Ccr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let x_char = if self.extend() { 'X' } else { '-' }; 
+        let n_char = if self.negative() { 'N' } else { '-' };
+        let z_char = if self.zero() { 'Z' } else { '-' };
+        let v_char = if self.overflow() { 'V' } else { '-' };
+        let c_char = if self.carry() { 'C' } else { '-' };
+        write!(f, "---{}{}{}{}{}", x_char, n_char, z_char, v_char, c_char)
     }
 }
 
@@ -133,58 +146,55 @@ impl Cpu {
             return;
         }
 
-        if addr == 0xA1_0003 || addr == 0xA1_0004 {
-            println!("Ignoring write to controller 1");
-            return;
-        }
-
-        if (0xA1_0000..=0xA1_001F).contains(&addr) {
-            // TODO:
-            println!("Ignoring write to some stuff: {:#08X}", addr);
-            return;
-        }
-
-        if addr == 0xA1_1100 || addr == 0xA1_1101 {
-            // TODO:
-            println!("Ignoring Z80 bus request");
-            return;
-        }
-
-        if addr == 0xA1_1200 {
-            // TODO:
-            println!("Ignoring Z80 reset");
-            return;
-        }
-
-        if (0xA0_0000..=0xA0_FFFF).contains(&addr) {
-            // TODO:
-            //println!("Ignoring write to Z80 memory");
-            return;
-        }
-
-        if addr == 0xC0_0011 || addr == 0xC0_0013 || addr == 0xC0_0015 || addr == 0xC0_0017 {
-            // TODO:
-            println!("Ignoring write to PSG output");
-            return;
-        }
-
-        if (0xA1_0020..=0xA1_10FF).contains(&addr) {
-            println!("Ignoring write to reserved memory");
-            return;
-        }
-
-        if (0xA1_30F1..=0xA1_30F2).contains(&addr) {
-            println!("Ignoring write of {:#X} to SRAM register", value);
-            return;
-        }
-
-        if (0xC0_0000..=0xC0_000F).contains(&addr) {
-            self.vdp
-                .upgrade()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .write(addr as u32, value, size, self);
+        match addr {
+            0xA1_003..=0xA1_004 => {
+                println!("Ignoring write to controller 1");
+                return;
+            }
+            0xA1_000..=0xA1_002 | 0xA1_005..=0xA1_00F => {
+                // TODO:
+                println!("Ignoring write to some stuff: {:#08X}", addr);
+                return;
+            }
+            0xA1_1100..=0xA1_1101 => {
+                // TODO:
+                println!("Ignoring Z80 bus request");
+                return;
+            }
+            0xA1_1200 => {
+                // TODO:
+                println!("Ignoring Z80 reset");
+                return;
+            }
+            0xA0_0000..=0xA0_FFFF => {
+                // TODO:
+                //println!("Ignoring write to Z80 memory");
+                return;
+            }
+            0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
+                // TODO:
+                println!("Ignoring write to PSG output");
+                return;
+            }
+            0xA1_0020..=0xA1_10FF => {
+                // Should we panic here, or not?
+                println!("Ignoring write to reserved memory");
+                return;
+            }
+            0xA1_30F1..=0xA1_30F2 => {
+                // TODO:
+                println!("Ignoring write of {:#X} to SRAM register", value);
+                return;
+            }
+            0xC0_0000..=0xC0_000F => {
+                self.vdp
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .write(addr as u32, value, size, self);
+            }
+            _ => {}
         }
 
         let value = &value.to_be_bytes()[4 - length..4];
@@ -292,7 +302,7 @@ impl Cpu {
 
                     if LOG_INSTR {
                         println!(
-                            "\nPC:{:08X}, A7: {:08X} CCR: {:?}",
+                            "\nPC:{:08X}, A7: {:08X} CCR: {}",
                             self.core.pc, self.core.addr[7], self.core.ccr,
                         );
                         std::io::stdout().flush().unwrap();

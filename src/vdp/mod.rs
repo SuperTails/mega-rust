@@ -5,6 +5,8 @@ use crate::Interrupt;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
 use std::convert::TryFrom;
+use bitfield::bitfield;
+use bitpat::bitpat;
 
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:

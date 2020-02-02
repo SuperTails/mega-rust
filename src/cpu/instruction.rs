@@ -1,6 +1,8 @@
 use super::{Ccr, Cpu, LOG_INSTR};
 use either::Either;
+use bitpat::bitpat;
 use num_traits::FromPrimitive;
+use num_derive::FromPrimitive;
 use std::convert::TryFrom;
 use std::fmt;
 pub use pages::*;

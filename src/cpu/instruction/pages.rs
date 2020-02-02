@@ -1,4 +1,5 @@
 use super::*;
+use bitpat::bitpat;
 
 pub trait Instr {
     fn size(&self) -> u32;
