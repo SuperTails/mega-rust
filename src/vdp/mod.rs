@@ -2,18 +2,20 @@ use crate::cpu::instruction::Size;
 use crate::cpu::Cpu;
 use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
+use bitfield::bitfield;
+use bitpat::bitpat;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
 use std::convert::TryFrom;
-use bitfield::bitfield;
-use bitpat::bitpat;
 
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:
 ///
 /// 64KiB VRAM: Used to store graphics data, i.e. nametable data, sprite data, and the horizontal
 /// scroll
+///
 /// 128 bytes CRAM: Used to store 64 different colors (4 palettes of 16 colors each)
+///
 /// 40x10bits VSRAM: Used to store vertical scroll data
 ///
 /// Information from segaretro.org
@@ -264,6 +266,144 @@ impl Vdp {
         TileEntry(entry)
     }
 
+    fn render_planes(&self, sdl_system: &mut SDLSystem) {
+        // TODO: Maybe use this?
+        let _plane_cell_height = self.plane_height / 8;
+        let plane_cell_width = self.plane_width / 8;
+
+        sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
+        for row in 0..self.plane_height {
+            for col in 0..self.plane_width {
+                let cell_row = row / 8;
+                let cell_col = col / 8;
+
+                let pixel_row = row % 8;
+                let pixel_col = col % 8;
+
+                let cell = cell_row * plane_cell_width + cell_col;
+
+                let get_color = |addr: u16| -> Option<(u8, u8, u8)> {
+                    let tile_entry = self.get_tile_entry(addr);
+
+                    let tile_addr = tile_entry.tile_index() as usize * 0x20;
+                    let palette_line = tile_entry.palette_line();
+
+                    let tile = &self.vram[tile_addr..][0..0x20];
+
+                    const BYTES_PER_ROW: usize = 4;
+
+                    let data_row = &tile[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
+                    let pixel_byte = data_row[pixel_col as usize / 2];
+                    let shift = if pixel_col % 2 == 1 { 0 } else { 4 };
+                    let data = (pixel_byte >> shift) & 0xF;
+
+                    if data == 0 {
+                        None
+                    } else {
+                        let color = self.cram[palette_line as usize * 0x10 + data as usize];
+                        Some((
+                            (color.red() as u8) << 5,
+                            (color.green() as u8) << 5,
+                            (color.blue() as u8) << 5,
+                        ))
+                    }
+                };
+
+                let addr_z = cell * 2 + self.window_nametable;
+                let addr_a = cell * 2 + self.plane_a_nametable;
+                let addr_b = cell * 2 + self.plane_b_nametable;
+
+                let color_z = get_color(addr_z);
+                let color_a = get_color(addr_a);
+                let color_b = get_color(addr_b);
+
+                let overall_color = if let Some(c) = color_a {
+                    c
+                } else if let Some(c) = color_b {
+                    c
+                } else if let Some(c) = color_z {
+                    c
+                } else {
+                    let bg_color = self.cram[self.bg_color as usize];
+                    (
+                        (bg_color.red() as u8) << 5,
+                        (bg_color.green() as u8) << 5,
+                        (bg_color.blue() as u8) << 5,
+                    )
+                };
+
+                sdl_system
+                    .canvas()
+                    .set_draw_color(Color::from(overall_color));
+                sdl_system
+                    .canvas()
+                    .draw_point(Point::new(col as i32, row as i32))
+                    .unwrap();
+            }
+        }
+    }
+
+    fn render_vram(&self, sdl_system: &mut SDLSystem) {
+        for r in 0..256 {
+            for c in 0..256 {
+                let entry = self.vram[r * 256 + c];
+
+                sdl_system
+                    .canvas()
+                    .set_draw_color(Color::RGB(entry, entry, entry));
+                sdl_system
+                    .canvas()
+                    .draw_point(Point::new(c as i32 + 256, r as i32))
+                    .unwrap();
+            }
+        }
+
+        let tables = [
+            (Color::RGB(255, 0, 0), self.plane_a_nametable),
+            (Color::RGB(0, 255, 0), self.plane_b_nametable),
+            (Color::RGB(0, 0, 255), self.window_nametable),
+        ];
+
+        for (color, table) in tables.iter().copied() {
+            let r = table / 256;
+            let c = table % 256;
+
+            sdl_system.canvas().set_draw_color(color);
+            sdl_system
+                .canvas()
+                .draw_point(Point::new(c as i32 + 256, r as i32))
+                .unwrap();
+        }
+    }
+
+    fn render_cram(&self, sdl_system: &mut SDLSystem) {
+        for p in 0..64 {
+            let red = (self.cram[p].red() as u8) << 4;
+            let green = (self.cram[p].green() as u8) << 4;
+            let blue = (self.cram[p].blue() as u8) << 4;
+
+            sdl_system
+                .canvas()
+                .set_draw_color(Color::RGB(red, green, blue));
+            sdl_system
+                .canvas()
+                .draw_point(Point::new((p % 16) as i32 + 512, p as i32 / 16))
+                .unwrap();
+        }
+    }
+
+    fn render(&self, sdl_system: &mut SDLSystem) {
+        sdl_system.canvas().set_draw_color(Color::RGB(50, 50, 50));
+        sdl_system.canvas().clear();
+
+        self.render_planes(sdl_system);
+        self.render_vram(sdl_system);
+        self.render_cram(sdl_system);
+
+        sdl_system.canvas().set_scale(0.5, 0.5).unwrap();
+        sdl_system.canvas().present();
+    }
+
     // 262 line range
     // 342 pixel range
     pub fn do_cycle(&mut self, sdl_system: &mut SDLSystem, int: &mut Option<Interrupt>) -> bool {
@@ -280,10 +420,11 @@ impl Vdp {
 
             if self.horiz_int_counter == 0 {
                 if self.mode1.horiz_interrupt() {
-                    assert!(
+                    // TODO: FIX
+                    /*assert!(
                         int == &None || int == &Some(Interrupt::Horizontal),
                         "Don't know how to handle multiple interrupts yet"
-                    );
+                    );*/
                     *int = Some(Interrupt::Horizontal);
                 }
 
@@ -299,127 +440,15 @@ impl Vdp {
             // One frame has finished
 
             if self.mode2.vert_interrupt() {
-                assert!(
+                // TODO: FIX
+                /*assert!(
                     int == &None || int == &Some(Interrupt::Vertical),
                     "Don't know how to handle multiple interrupts yet"
-                );
+                );*/
                 *int = Some(Interrupt::Vertical);
             }
 
-            sdl_system.canvas().set_draw_color(Color::RGB(50, 50, 50));
-            sdl_system.canvas().clear();
-
-            // TODO: Maybe use this?
-            let _plane_cell_height = self.plane_height / 8;
-            let plane_cell_width = self.plane_width / 8;
-
-            sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
-            for row in 0..self.plane_height {
-                for col in 0..self.plane_width {
-                    let cell_row = row / 8;
-                    let cell_col = col / 8;
-
-                    let pixel_row = row % 8;
-                    let pixel_col = col % 8;
-
-                    let cell = cell_row * plane_cell_width + cell_col;
-
-                    let get_color = |addr: u16| -> Option<(u8, u8, u8)> {
-                        /*let idx = self.get_tile_entry(addr).tile_index();
-                        let r = idx as u8 & 0xF;
-                        let g = (idx >> 4) as u8 & 0xF;
-                        let b = (idx >> 8) as u8 & 0x7;
-                        (r * 10, g * 10, b * 20)*/
-                        let tile_entry = self.get_tile_entry(addr);
-
-                        let tile_addr = tile_entry.tile_index() as usize * 0x20;
-                        let palette_line = tile_entry.palette_line();
-
-                        let tile = &self.vram[tile_addr..][0..0x20];
-
-                        const BYTES_PER_ROW: usize = 4;
-
-                        let data_row =
-                            &tile[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
-                        let pixel_byte = data_row[pixel_col as usize / 2];
-                        let shift = if pixel_col % 2 == 1 { 0 } else { 4 };
-                        let data = (pixel_byte >> shift) & 0xF;
-
-                        if data == 0 {
-                            None
-                        } else {
-                            let color = self.cram[palette_line as usize * 0x10 + data as usize];
-                            Some((
-                                (color.red() as u8) << 5,
-                                (color.green() as u8) << 5,
-                                (color.blue() as u8) << 5,
-                            ))
-                        }
-                    };
-
-                    let addr_z = cell * 2 + self.window_nametable;
-                    let addr_a = cell * 2 + self.plane_a_nametable;
-                    let addr_b = cell * 2 + self.plane_b_nametable;
-
-                    let color_z = get_color(addr_z);
-                    let color_a = get_color(addr_a);
-                    let color_b = get_color(addr_b);
-
-                    let overall_color = if let Some(c) = color_a {
-                        c
-                    } else if let Some(c) = color_b {
-                        c
-                    } else if let Some(c) = color_z {
-                        c
-                    } else {
-                        let bg_color = self.cram[self.bg_color as usize];
-                        (
-                            (bg_color.red() as u8) << 5,
-                            (bg_color.green() as u8) << 5,
-                            (bg_color.blue() as u8) << 5,
-                        )
-                    };
-
-                    sdl_system
-                        .canvas()
-                        .set_draw_color(Color::from(overall_color));
-                    sdl_system
-                        .canvas()
-                        .draw_point(Point::new(col as i32, row as i32))
-                        .unwrap();
-                }
-            }
-
-            for r in 0..256 {
-                for c in 0..256 {
-                    let entry = self.vram[r * 256 + c];
-
-                    sdl_system
-                        .canvas()
-                        .set_draw_color(Color::RGB(entry, entry, entry));
-                    sdl_system
-                        .canvas()
-                        .draw_point(Point::new(c as i32 + 256, r as i32))
-                        .unwrap();
-                }
-            }
-
-            for p in 0..64 {
-                let red = (self.cram[p].red() as u8) << 4;
-                let green = (self.cram[p].green() as u8) << 4;
-                let blue = (self.cram[p].blue() as u8) << 4;
-
-                sdl_system
-                    .canvas()
-                    .set_draw_color(Color::RGB(red, green, blue));
-                sdl_system
-                    .canvas()
-                    .draw_point(Point::new((p % 16) as i32 + 512, p as i32 / 16))
-                    .unwrap();
-            }
-            sdl_system.canvas().set_scale(0.5, 0.5).unwrap();
-
-            sdl_system.canvas().present();
+            self.render(sdl_system);
 
             for event in sdl_system.event_pump.poll_iter() {
                 match event {
@@ -705,7 +734,7 @@ impl Vdp {
                                 cpu.read(self.dma_source + i as u32 * 2, Size::Word) as u16;
                         }
                     }
-                    _ => unimplemented!("CPU to VDP destination {:?}", self.dma_target),
+                    _ => todo!("CPU to VDP destination {:?}", self.dma_target),
                 }
             }
             CDMode::VramCopy => {

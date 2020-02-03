@@ -3,13 +3,13 @@ use crate::get_four_bytes;
 use crate::get_two_bytes;
 use crate::vdp::Vdp;
 use crate::Interrupt;
+use bitfield::bitfield;
 use instruction::{Instruction, Size};
+use std::fmt;
 use std::io::Write;
 use std::sync::{Mutex, Weak};
-use std::fmt;
-use bitfield::bitfield;
 
-const LOG_INSTR: bool = true;
+const LOG_INSTR: bool = false;
 
 bitfield! {
     #[derive(Clone, Copy, PartialEq)]
@@ -31,7 +31,7 @@ impl Ccr {
 
 impl fmt::Display for Ccr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let x_char = if self.extend() { 'X' } else { '-' }; 
+        let x_char = if self.extend() { 'X' } else { '-' };
         let n_char = if self.negative() { 'N' } else { '-' };
         let z_char = if self.zero() { 'Z' } else { '-' };
         let v_char = if self.overflow() { 'V' } else { '-' };
@@ -65,7 +65,8 @@ pub struct Cpu {
     pub core: CpuCore,
     pub rom: Box<[u8]>,
     pub cart_ram: Box<[u8]>,
-    pub ram: [u8; 0x10000],
+    pub ram: [u8; 0x1_0000],
+    pub z80_ram: [u8; 0x1_0000],
     vdp: Weak<Mutex<Vdp>>,
 }
 
@@ -82,7 +83,8 @@ impl Cpu {
             core: CpuCore::new(),
             rom,
             cart_ram,
-            ram: [0; 0x10000],
+            ram: [0; 0x1_0000],
+            z80_ram: [0; 0x1_0000],
             vdp,
         }
     }
@@ -121,6 +123,9 @@ impl Cpu {
                 self.cart_ram[byte_addr - self.rom.len()]
             } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
                 self.ram[byte_addr - 0xFF_0000]
+            } else if (0xA0_0000..=0xA0_FFFF).contains(&byte_addr) {
+                // TODO: Determine if this is specially mapped
+                self.z80_ram[byte_addr - 0xA0_0000]
             } else {
                 println!("Unimplemented address {:#X}, reading zero", addr);
                 0
@@ -138,7 +143,13 @@ impl Cpu {
 
         let addr = (addr & 0xFF_FF_FF) as usize;
 
-        assert_eq!(addr & (align - 1), 0, "Addr: {:#06X}", addr);
+        assert_eq!(
+            addr & (align - 1),
+            0,
+            "Invalid unaligned write of size {:?} with addr: {:#08X}",
+            size,
+            addr
+        );
 
         if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
             let vdp = self.vdp.upgrade().unwrap();
@@ -147,11 +158,11 @@ impl Cpu {
         }
 
         match addr {
-            0xA1_003..=0xA1_004 => {
+            0xA1_0003..=0xA1_0004 => {
                 println!("Ignoring write to controller 1");
                 return;
             }
-            0xA1_000..=0xA1_002 | 0xA1_005..=0xA1_00F => {
+            0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
                 // TODO:
                 println!("Ignoring write to some stuff: {:#08X}", addr);
                 return;
@@ -208,6 +219,9 @@ impl Cpu {
                 self.cart_ram[byte_addr - self.rom.len()] = *byte;
             } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
                 self.ram[byte_addr - 0xFF_0000] = *byte;
+            } else if (0xA0_0000..=0xA0_FFFF).contains(&byte_addr) {
+                // TODO: Determine if this is specially mapped
+                self.z80_ram[byte_addr - 0xA0_0000] = *byte;
             } else {
                 println!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };

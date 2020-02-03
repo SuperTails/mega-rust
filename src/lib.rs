@@ -102,6 +102,15 @@ pub fn run(cart: Cart) {
             cpu.core = log[0].clone();
         }*/
 
+        let instr = cpu.instr_at(cpu.core.pc);
+        if let cpu::instruction::Instruction {
+            opcode:
+                cpu::instruction::Pages::Miscellaneous(cpu::instruction::Miscellaneous::MoveM(_, _, _)),
+        } = instr
+        {
+            hit_breakpoint = false;
+        }
+
         if hit_breakpoint {
             'wait: loop {
                 for event in sdl_system.event_pump.poll_iter() {
@@ -138,8 +147,7 @@ pub fn run(cart: Cart) {
             }
         }
 
-        /*let instr = cpu.instr_at(cpu.core.pc);
-        if let Instruction { opcode: Pages::Immediates(Immediates{ op: SimpleOp::Or, .. }) } = instr {
+        /*if let Instruction { opcode: Pages::Immediates(Immediates{ op: SimpleOp::Or, .. }) } = instr {
             if cpu.read(cpu.core.pc + 2, &cpu::instruction::Size::Byte) == 0x40 {
                 hit_breakpoint = true;
             }

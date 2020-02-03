@@ -1,7 +1,7 @@
-use std::fmt;
 use super::Size;
 use crate::cpu::Cpu;
 use crate::cpu::LOG_INSTR;
+use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum AddrMode {
@@ -292,4 +292,3 @@ impl Into<u8> for AddrReg {
         self.0
     }
 }
-
