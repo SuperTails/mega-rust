@@ -8,8 +8,20 @@ use instruction::{Instruction, Size};
 use std::fmt;
 use std::io::Write;
 use std::sync::{Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use lazy_static::lazy_static;
 
-const LOG_INSTR: bool = false;
+lazy_static! {
+    static ref LOG_INSTR: AtomicBool = AtomicBool::new(false);
+}
+
+pub fn do_log(do_l: bool) {
+    LOG_INSTR.store(do_l, Ordering::SeqCst)
+}
+
+pub fn log_instr() -> bool {
+    LOG_INSTR.load(Ordering::SeqCst)
+}
 
 bitfield! {
     #[derive(Clone, Copy, PartialEq)]
@@ -44,6 +56,18 @@ impl fmt::Display for Ccr {
 pub enum State {
     Run,
     Reset,
+}
+
+impl fmt::Display for CpuCore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "======== CPU Core State =========")?;
+        writeln!(f, "PC: {:#06X} USP: {:#06X}, CCR: {}", self.pc, self.usp, self.ccr)?;
+        writeln!(f, "------------- Registers ---------")?;
+        for (idx, (d, a)) in self.data.iter().zip(self.addr.iter()).enumerate() {
+            writeln!(f, "d{}/a{} | {:#010X} | {:#010X}", idx, idx, d, a)?;
+        }
+        write!(f, "---------------------------------")
+    }
 }
 
 /// Represents the current state of the 68k
@@ -100,6 +124,11 @@ impl Cpu {
         if size == Size::Long && addr == 0xFFFF_FFFC {
             println!("RETURNING 'init'");
             return u32::from_be_bytes(*b"init");
+        }
+
+        if addr == 0xA1_0000 || addr == 0xA1_0001 {
+            // TODO: Is this correct?
+            return u32::from_be_bytes(*b"\0\0UE");
         }
 
         if addr == 0xA1_0003 || addr == 0xA1_0004 {
@@ -175,11 +204,6 @@ impl Cpu {
             0xA1_1200 => {
                 // TODO:
                 println!("Ignoring Z80 reset");
-                return;
-            }
-            0xA0_0000..=0xA0_FFFF => {
-                // TODO:
-                //println!("Ignoring write to Z80 memory");
                 return;
             }
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
@@ -314,7 +338,7 @@ impl Cpu {
 
                     let offset = self.core.pc % self.rom.len() as u32;
 
-                    if LOG_INSTR {
+                    if log_instr() {
                         println!(
                             "\nPC:{:08X}, A7: {:08X} CCR: {}",
                             self.core.pc, self.core.addr[7], self.core.ccr,
@@ -324,7 +348,7 @@ impl Cpu {
 
                     let instr = self.instr_at(offset as u32);
 
-                    if LOG_INSTR {
+                    if log_instr() {
                         println!("Instr: {:?}", instr.opcode);
                     }
 

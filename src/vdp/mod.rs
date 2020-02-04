@@ -231,6 +231,11 @@ bitfield! {
 
 impl Vdp {
     pub fn new() -> Vdp {
+        let mut vram = [0; 0x1_00_00];
+        for (i, e) in vram.iter_mut().enumerate() {
+            *e = i as u8;
+        }
+
         Vdp {
             ram_address: (0, false, RamMode::VRam),
             mode1: VdpMode1(0),
@@ -255,7 +260,7 @@ impl Vdp {
             dma_source: 0,
             cycle: 0,
             auto_increment: 0,
-            vram: [0; 0x1_00_00],
+            vram,
             cram: [CRamEntry(0); 0x40],
             vsram: [0; 40],
         }
@@ -641,7 +646,7 @@ impl Vdp {
                 println!("DMA source is now {:#X}", self.dma_target.0);
             }
             _ => {
-                unimplemented!("Ignoring write of {:#X} to register {:#X}", value, index);
+                println!("TODO: Ignoring write of {:#X} to register {:#X}", value, index);
             }
         }
     }

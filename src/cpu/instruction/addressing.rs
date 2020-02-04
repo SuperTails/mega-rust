@@ -1,6 +1,6 @@
 use super::Size;
 use crate::cpu::Cpu;
-use crate::cpu::LOG_INSTR;
+use crate::cpu::log_instr;
 use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -59,7 +59,7 @@ impl AddrMode {
                 0 => AddrMode::AbsShort,
                 1 => AddrMode::AbsLong,
                 4 => AddrMode::Immediate,
-                _ => panic!(),
+                _ => panic!("Invalid addressing mode suffix {:?}", field),
             },
             _ => unreachable!(),
         }
@@ -71,7 +71,7 @@ impl AddrMode {
         let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
         let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8;
 
-        if LOG_INSTR {
+        if log_instr() {
             print!("Base offset of {:#X} ", offset);
         }
 
@@ -79,12 +79,12 @@ impl AddrMode {
         let reg_type = (index_info >> 7) != 0;
         let reg_index = (index_info >> 4) & 0x7;
         let reg_offset = if reg_type {
-            if LOG_INSTR {
+            if log_instr() {
                 println!("and using register a{}", reg_index);
             }
             cpu.core.addr[reg_index as usize]
         } else {
-            if LOG_INSTR {
+            if log_instr() {
                 println!("and using register d{}", reg_index);
             }
             cpu.core.data[reg_index as usize]
@@ -112,9 +112,8 @@ impl AddrMode {
                 Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Word) as i16 as i32 as u32)
             }
             AddrMode::PcDisp => {
-                // TODO: Is the displacement signed?
-                let offset = cpu.read(cpu.core.pc + extra + 2, Size::Word);
-                Address::Address(cpu.core.pc + 2 + offset)
+                let offset = cpu.read(cpu.core.pc + extra + 2, Size::Word) as i16 as i64;
+                Address::Address((cpu.core.pc as i64 + 2 + offset) as u32)
             }
             AddrMode::PcIndex => self.address_index(extra, cpu, cpu.core.pc + 2),
             AddrMode::AddrIndex(reg) => {

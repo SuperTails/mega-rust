@@ -1,4 +1,4 @@
-use super::{Ccr, Cpu, LOG_INSTR};
+use super::{Ccr, Cpu, log_instr};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
@@ -10,6 +10,20 @@ use std::fmt;
 
 mod addressing;
 mod pages;
+
+fn read_immediate(cpu: &Cpu, size: Size) -> u32 {
+    let new_size = if size == Size::Byte {
+        Size::Word
+    } else {
+        size
+    };
+
+    let result = cpu.read(cpu.core.pc + 2, new_size);
+    if size == Size::Byte {
+        assert_eq!(result >> 8, 0);
+    }
+    result
+}
 
 #[derive(Debug, FromPrimitive, PartialEq)]
 pub enum Condition {
@@ -328,7 +342,7 @@ impl Instr for Immediates {
     fn execute(&self, cpu: &mut Cpu) {
         let value = self.read(cpu);
 
-        let arg = cpu.read(cpu.core.pc + 2, self.size);
+        let arg = read_immediate(cpu, self.size);
         let (value, ccr) = self.op.apply(value, arg, self.size, cpu.core.ccr);
 
         self.write(value, cpu);
@@ -406,7 +420,7 @@ impl BitOperation {
         let shift_amount = if let Some(data_reg) = self.data_reg {
             data_reg.read(cpu)
         } else {
-            cpu.read(cpu.core.pc + 2, Size::Byte)
+            read_immediate(cpu, Size::Byte)
         };
 
         let shift_amount = shift_amount % self.shift_mod();
@@ -525,7 +539,7 @@ impl Instr for Miscellaneous {
                 cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
                 cpu.write(cpu.core.addr[7], stored, Size::Long);
 
-                if LOG_INSTR {
+                if log_instr() {
                     println!("Pushed return address {:#X}", stored)
                 }
 
@@ -538,7 +552,7 @@ impl Instr for Miscellaneous {
             Miscellaneous::Jmp(mode) => {
                 if let Address::Address(dest) = mode.address(false, Size::Byte, cpu) {
                     cpu.core.pc = dest - self.size();
-                    if LOG_INSTR {
+                    if log_instr() {
                         println!("JMP, PC will be {:#X}", cpu.core.pc + self.size());
                     }
                 } else {
@@ -548,7 +562,7 @@ impl Instr for Miscellaneous {
             Miscellaneous::Lea(reg, mode) => {
                 // TODO: Make sure this is actually what this instruction does
                 if let Address::Address(address) = mode.address(false, Size::Long, cpu) {
-                    if LOG_INSTR {
+                    if log_instr() {
                         println!("Lea {:?} = {:#X}", reg, address)
                     }
                     reg.write(address, cpu);
@@ -643,8 +657,9 @@ impl Miscellaneous {
         cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
         cpu.write(cpu.core.addr[7], reg.read(cpu), Size::Long);
         reg.write(cpu.core.addr[7], cpu);
-        let disp = cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32 as u32;
-        cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp);
+        let disp = read_immediate(cpu, Size::Word) as i16 as i32;
+        println!("Disp: {:#X}", disp);
+        cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp as u32);
     }
 
     fn unlink(reg: AddrReg, cpu: &mut Cpu) {
@@ -698,14 +713,14 @@ impl Miscellaneous {
             AddrMode::Addr(reg) => {
                 // false -> register to memory
                 // true -> memory to register
-                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+                let mask = read_immediate(cpu, Size::Word) as u16;
                 let mut addr = cpu.core.addr[reg as usize];
 
                 // Note: it is intentional that the modified address is not used
                 Miscellaneous::movem_control(direction, &mut addr, size, mask, cpu);
             }
             AddrMode::AddrDisp(_) => {
-                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+                let mask = read_immediate(cpu, Size::Word) as u16;
                 // This may not be ordered correctly?
                 let mut addr = if let Address::Address(addr) = mode.address(true, Size::Word, cpu) {
                     addr
@@ -716,7 +731,7 @@ impl Miscellaneous {
                 Miscellaneous::movem_control(direction, &mut addr, size, mask, cpu);
             }
             AddrMode::AbsLong | AddrMode::AbsShort => {
-                let mask = cpu.read(cpu.core.pc + 2, Size::Word) as u16;
+                let mask = read_immediate(cpu, Size::Word) as u16;
                 let mut addr = if let Address::Address(addr) = mode.address(true, Size::Word, cpu) {
                     addr
                 } else {
@@ -924,7 +939,7 @@ impl Instr for Branch {
                 .pc
                 .wrapping_add(displacement.wrapping_add(2) as u32);
 
-            if LOG_INSTR {
+            if log_instr() {
                 println!(
                     "Branch (to subroutine) taken, PC will be {:#X}",
                     cpu.core.pc
@@ -937,7 +952,7 @@ impl Instr for Branch {
                 .core
                 .pc
                 .wrapping_add(displacement.wrapping_add(2) as u32);
-            if LOG_INSTR {
+            if log_instr() {
                 println!("Branch taken, PC will be {:#X}", cpu.core.pc);
             }
 
@@ -1153,7 +1168,7 @@ fn compare(dst: u32, src: u32, size: Size, is_add: bool) -> Ccr {
         (src_sign && !dst_sign) || (result_sign && !dst_sign) || (src_sign && result_sign)
     };
 
-    if LOG_INSTR {
+    if log_instr() {
         println!(
             "Compared dst: {:#X} - src {:#X} = {:#X}",
             dst, src, masked_result
@@ -1299,8 +1314,7 @@ impl Instr for LinearOp {
 
 #[derive(Debug)]
 pub enum ConditionsQuicks {
-    // Bool is true if it's a subtraction
-    AddSubQ(bool, u8, Size, AddrMode),
+    AddSubQ{ is_sub: bool, data: u8, size: Size, mode: AddrMode },
     Set(Condition, AddrMode),
     DecBranch(Condition, DataReg),
 }
@@ -1308,7 +1322,7 @@ pub enum ConditionsQuicks {
 impl Instr for ConditionsQuicks {
     fn size(&self) -> u32 {
         2 + match self {
-            ConditionsQuicks::AddSubQ(_, _, size, mode) => mode.arg_length(*size),
+            ConditionsQuicks::AddSubQ{ size, mode, .. } => mode.arg_length(*size),
             ConditionsQuicks::Set(_, mode) => mode.arg_length(Size::Byte),
             ConditionsQuicks::DecBranch(_, _) => 2,
         }
@@ -1316,8 +1330,8 @@ impl Instr for ConditionsQuicks {
 
     fn execute(&self, cpu: &mut Cpu) {
         match self {
-            ConditionsQuicks::AddSubQ(is_sub, data, size, mode) => {
-                let dst = mode.read(false, *size, cpu);
+            ConditionsQuicks::AddSubQ{ is_sub, data, size, mode } => {
+            let dst = mode.read(false, *size, cpu);
                 let arg = if *data == 0 { 8 } else { *data };
                 let (result, ccr) = LinearOp::do_op(!is_sub, dst, arg as u32, *size);
                 mode.write(result, false, *size, cpu);
@@ -1335,7 +1349,7 @@ impl Instr for ConditionsQuicks {
                     low_word = low_word.wrapping_sub(1);
                     reg.write_sized(low_word as u32, Size::Word, cpu);
 
-                    if LOG_INSTR {
+                    if log_instr() {
                         println!("Reg is now {:#b}", reg.read(cpu));
                     }
 
@@ -1388,7 +1402,7 @@ impl TryFrom<u16> for ConditionsQuicks {
             let is_sub = (data >> 8) & 1 != 0;
             let value = (data >> 9) as u8 & 7;
             let mode = AddrMode::new(data as u8 & 0x3F);
-            Ok(ConditionsQuicks::AddSubQ(is_sub, value, size, mode))
+            Ok(ConditionsQuicks::AddSubQ{ is_sub, data: value, size, mode })
         }
     }
 }
@@ -1421,7 +1435,7 @@ impl TryFrom<u16> for CompareEor {
             let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
             let source_reg = AddrReg::new(data as u8 & 0x7);
             let mode = CompareMode::Memory(dest_reg, source_reg);
-            let size = Size::normal((data >> 6) as u8 & 0x7);
+            let size = Size::normal((data >> 6) as u8 & 0x3);
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
         } else if (data >> 6) & 0b11 == 0b11 {
@@ -1625,8 +1639,7 @@ impl Instr for Shifts {
                 }
                 ShiftType::RotateExtend => {
                     cpu.core.ccr.set_overflow(false);
-                    cpu.core.ccr.set_carry(false);
-                    cpu.core.ccr.set_extend(false);
+                    cpu.core.ccr.set_carry(cpu.core.ccr.extend());
 
                     for _ in 0..amount {
                         let new_bit = (top_bit_mask & value) != 0;
@@ -1892,7 +1905,7 @@ standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) {
     cpu.core.sr    = (new_sr >> 8) as u8;
     cpu.core.ccr.0 = (new_sr     ) as u8;
 
-    if LOG_INSTR { println!("Return from exception, PC will be {:#X}", cpu.core.pc) }
+    if log_instr() { println!("Return from exception, PC will be {:#X}", cpu.core.pc) }
 
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });
@@ -1903,7 +1916,7 @@ standalone_operation!(Return, fn execute(&self, cpu: &mut Cpu) {
 
     cpu.core.pc = new;
 
-    if LOG_INSTR { println!("Returning, PC will be {:#X}", cpu.core.pc) }
+    if log_instr() { println!("Returning, PC will be {:#X}", cpu.core.pc) }
 
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });
