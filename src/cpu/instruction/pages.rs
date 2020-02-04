@@ -39,9 +39,11 @@ macro_rules! make_dispatcher {
     };
 }
 
+
 make_dispatcher! { Pages :
     Immediates, // First half of 0b0000
     BitOperation, // Other half of 0b0000
+    MoveP, // And also in 0b0000
 
     Move, //0b0001, 0b0010, 0b0011
 
@@ -93,7 +95,11 @@ impl TryFrom<u16> for Pages {
         match page {
             0b0000 => {
                 if bitpat!(1 0 0 _)(word >> 8) || bitpat!(_ _ _ 1)(word >> 8) {
-                    Ok(Pages::BitOperation(BitOperation::try_from(word).unwrap()))
+                    if bitpat!(0 0 1)(word >> 3) {
+                        Ok(Pages::MoveP(MoveP::try_from(word).unwrap()))
+                    } else {
+                        Ok(Pages::BitOperation(BitOperation::try_from(word).unwrap()))
+                    }
                 } else {
                     Ok(Pages::Immediates(Immediates::try_from(word).unwrap()))
                 }

@@ -9,6 +9,7 @@ use std::fmt;
 use std::io::Write;
 use std::sync::{Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BinaryHeap;
 use lazy_static::lazy_static;
 
 lazy_static! {
@@ -259,7 +260,7 @@ impl Cpu {
     }
 
     // TODO: Access Z80, VDP, expansion ports, and IO registers
-    pub fn do_cycle(&mut self, requested_int: &mut Option<Interrupt>) {
+    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
         match self.core.state {
             State::Reset => {
                 assert_eq!(self.core.pc % 4, 0);
@@ -292,37 +293,37 @@ impl Cpu {
                     panic!("Hit 0x43A");
                 }*/
 
-                if let Some(int) = requested_int {
+                if let Some(int) = pending.peek() {
                     let mask_level = self.core.sr & 0x7;
 
-                    match int {
-                        Interrupt::External if mask_level < 2 => {
-                            unimplemented!("External interrupt");
-                        }
-                        Interrupt::Horizontal if mask_level < 4 => {
-                            unimplemented!("Horizontal interrupt");
-                        }
-                        Interrupt::Vertical if mask_level < 6 => {
-                            // TODO: Should this clear the interrupt?
-                            *requested_int = None;
+                    if *int as u8 > mask_level {
+                        let int = pending.pop().unwrap();
+                        match int {
+                            Interrupt::External if mask_level < 2 => {
+                                unimplemented!("External interrupt");
+                            }
+                            Interrupt::Horizontal if mask_level < 4 => {
+                                unimplemented!("Horizontal interrupt");
+                            }
+                            Interrupt::Vertical if mask_level < 6 => {
+                                // TODO: This should use the SSP instead of A7 I think
+                                self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
+                                self.write(self.core.addr[7], self.core.pc, Size::Long);
+                                self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
+                                self.write(
+                                    self.core.addr[7],
+                                    ((self.core.sr as u32) << 8) | self.core.ccr.0 as u32,
+                                    Size::Word,
+                                );
 
-                            // TODO: This should use the SSP instead of A7 I think
-                            self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
-                            self.write(self.core.addr[7], self.core.pc, Size::Long);
-                            self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
-                            self.write(
-                                self.core.addr[7],
-                                ((self.core.sr as u32) << 8) | self.core.ccr.0 as u32,
-                                Size::Word,
-                            );
+                                let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
 
-                            let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
-
-                            self.core.sr = 6;
-                            self.core.pc = vector;
-                            println!("Did vertical interrupt");
+                                self.core.sr = 6;
+                                self.core.pc = vector;
+                                println!("Did vertical interrupt");
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
 

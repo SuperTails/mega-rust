@@ -7,6 +7,7 @@ use bitpat::bitpat;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
 use std::convert::TryFrom;
+use std::collections::BinaryHeap;
 
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:
@@ -33,8 +34,14 @@ pub struct Vdp {
 
     write_pending: Option<u16>,
 
+    /// Address in VRAM of the beginning of the nametable
+    /// for plane A.
     plane_a_nametable: u16,
+    /// Address in VRAM of the beginning of the nametable
+    /// for plane B.
     plane_b_nametable: u16,
+    /// Address in VRAM of the beginning of the nametable
+    /// for the background/window.
     window_nametable: u16,
 
     sprite_table_addr: u16,
@@ -56,9 +63,12 @@ pub struct Vdp {
     pixel: u32,
     scanline: u32,
 
-    // 64KiB
+    /// The array representing the VDP's 64KiB of VRAM.
+    /// VRAM is used for storing graphics data, e.g.
+    /// nametable data, sprite data, and the horizontal scroll
     vram: [u8; 0x1_00_00],
-    // 128 bytes
+
+    /// The array representing the VDP's 128 bytes of CRAM, used for 64 different colors.
     cram: [CRamEntry; 0x40],
 
     // 40 10-bit entries
@@ -411,7 +421,7 @@ impl Vdp {
 
     // 262 line range
     // 342 pixel range
-    pub fn do_cycle(&mut self, sdl_system: &mut SDLSystem, int: &mut Option<Interrupt>) -> bool {
+    pub fn do_cycle(&mut self, sdl_system: &mut SDLSystem, int: &mut BinaryHeap<Interrupt>) -> bool {
         self.cycle += 1;
 
         // TODO: It should be 488.5 I think,
@@ -424,13 +434,8 @@ impl Vdp {
             // TODO: Horizontal interrupts
 
             if self.horiz_int_counter == 0 {
-                if self.mode1.horiz_interrupt() {
-                    // TODO: FIX
-                    /*assert!(
-                        int == &None || int == &Some(Interrupt::Horizontal),
-                        "Don't know how to handle multiple interrupts yet"
-                    );*/
-                    *int = Some(Interrupt::Horizontal);
+                if self.mode1.horiz_interrupt() && !int.iter().any(|i| i == &Interrupt::Horizontal) {
+                    int.push(Interrupt::Horizontal);
                 }
 
                 self.horiz_int_counter = self.horiz_int_period;
@@ -444,13 +449,8 @@ impl Vdp {
             self.scanline = 0;
             // One frame has finished
 
-            if self.mode2.vert_interrupt() {
-                // TODO: FIX
-                /*assert!(
-                    int == &None || int == &Some(Interrupt::Vertical),
-                    "Don't know how to handle multiple interrupts yet"
-                );*/
-                *int = Some(Interrupt::Vertical);
+            if self.mode2.vert_interrupt() && !int.iter().any(|i| i == &Interrupt::Vertical) {
+                int.push(Interrupt::Vertical);
             }
 
             self.render(sdl_system);
@@ -660,8 +660,8 @@ impl Vdp {
     pub fn parse_control_write(&mut self, value: u32) -> (u16, u8) {
         let bytes = value.to_be_bytes();
 
-        assert_eq!(bytes[2], 0);
-        assert_eq!(bytes[3] & 0b1100, 0);
+        assert_eq!(bytes[2], 0, "Invalid control write: {:#X}", value);
+        assert_eq!(bytes[3] & 0b1100, 0, "Invalid control write: {:#X}", value);
 
         let address = ((value as u16 & 0b11) << 14)
             | ((bytes[0] as u16 & 0b111_111) << 8)

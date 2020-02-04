@@ -118,12 +118,12 @@ impl Size {
         }
     }
 
-    pub fn normal(data: u8) -> Size {
+    pub fn normal(data: u8) -> Result<Size, String> {
         match data {
-            0 => Size::Byte,
-            1 => Size::Word,
-            2 => Size::Long,
-            _ => panic!("Invalid size {}", data),
+            0 => Ok(Size::Byte),
+            1 => Ok(Size::Word),
+            2 => Ok(Size::Long),
+            _ => Err(format!("Invalid size {}", data)),
         }
     }
 
@@ -280,7 +280,7 @@ impl TryFrom<u16> for Immediates {
 
     fn try_from(data: u16) -> Result<Self, Self::Error> {
         let mode = AddrMode::new(data as u8 & 0x3F);
-        let size = Size::normal(data as u8 >> 6);
+        let size = Size::normal(data as u8 >> 6)?;
         let op = SimpleOp::from_u16((data >> 9) & 0x7)
             .ok_or_else(|| format!("Invalid op type {:#b}", (data >> 9) & 0x7))?;
 
@@ -815,7 +815,7 @@ impl TryFrom<u16> for Miscellaneous {
             let size = if size == 0b11 {
                 None
             } else {
-                Some(Size::normal(size))
+                Some(Size::normal(size)?)
             };
 
             Ok(Miscellaneous::Test(size, mode))
@@ -829,11 +829,11 @@ impl TryFrom<u16> for Miscellaneous {
             Ok(Miscellaneous::Lea(reg, mode))
         } else if (data >> 8) & 0b1111 == 0b0100 {
             let mode = AddrMode::new(low_byte & 0x3F);
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             Ok(Miscellaneous::Neg(size, mode))
         } else if (data >> 8) & 0b1111 == 0b0110 {
             let mode = AddrMode::new(low_byte & 0x3F);
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             Ok(Miscellaneous::Not(size, mode))
         } else if (data >> 7) & 0b111 == 0b001 {
             let direction = (data >> 10) & 1 != 0;
@@ -845,7 +845,7 @@ impl TryFrom<u16> for Miscellaneous {
             let reg = AddrReg::new(data as u8 & 0x7);
             Ok(Miscellaneous::MoveUsp(direction, reg))
         } else if data >> 8 == 0b0100_0010 {
-            let size = Size::normal(data as u8 >> 6);
+            let size = Size::normal(data as u8 >> 6)?;
             let mode = AddrMode::new(low_byte & 0x3F);
             Ok(Miscellaneous::Clear(size, mode))
         } else {
@@ -1227,7 +1227,7 @@ impl TryFrom<u16> for LinearOp {
                 op_type,
             })
         } else if bitpat!(1 _ _ 0 0)((data >> 4) & 0b11111) {
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             let to_reg = (data >> 9) as u8 & 0x7;
             let from_reg = data as u8 & 0x7;
             let mode = if (data >> 3) & 1 != 0 {
@@ -1244,7 +1244,7 @@ impl TryFrom<u16> for LinearOp {
                 op_type,
             })
         } else {
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             let to_reg = DataReg::new((data >> 9) as u8 & 7);
             let mode = AddrMode::new(data as u8 & 0x3F);
             let direction = (data >> 8) & 1 != 0;
@@ -1398,7 +1398,7 @@ impl TryFrom<u16> for ConditionsQuicks {
                 Ok(ConditionsQuicks::Set(condition, mode))
             }
         } else {
-            let size = Size::normal(size);
+            let size = Size::normal(size)?;
             let is_sub = (data >> 8) & 1 != 0;
             let value = (data >> 9) as u8 & 7;
             let mode = AddrMode::new(data as u8 & 0x3F);
@@ -1430,30 +1430,30 @@ impl TryFrom<u16> for CompareEor {
             return Err(format!("Invalid top nybble {:#b}", top_nybble));
         }
 
-        if bitpat!(1 _ _ 0 0 1)(data >> 3) {
-            // TODO: These may be flipped
-            let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
-            let source_reg = AddrReg::new(data as u8 & 0x7);
-            let mode = CompareMode::Memory(dest_reg, source_reg);
-            let size = Size::normal((data >> 6) as u8 & 0x3);
-            let data = Either::Left(mode);
-            Ok(CompareEor { size, data })
-        } else if (data >> 6) & 0b11 == 0b11 {
+        if (data >> 6) & 0b11 == 0b11 {
             let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let size = Size::single_bit((data >> 8) & 1 != 0);
             let mode = CompareMode::Address(dest_reg, source_mode);
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
+        } else if bitpat!(1 _ _ 0 0 1)(data >> 3) {
+            // TODO: These may be flipped
+            let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
+            let source_reg = AddrReg::new(data as u8 & 0x7);
+            let mode = CompareMode::Memory(dest_reg, source_reg);
+            let size = Size::normal((data >> 6) as u8 & 0x3)?;
+            let data = Either::Left(mode);
+            Ok(CompareEor { size, data })
         } else if (data >> 8) & 1 == 0 {
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             let mode = CompareMode::Normal(dest_reg, source_mode);
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
         } else {
-            let size = Size::normal((data >> 6) as u8 & 3);
+            let size = Size::normal((data >> 6) as u8 & 3)?;
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let data = Either::Right((dest_reg, source_mode));
@@ -1525,7 +1525,7 @@ impl ShiftType {
 }
 
 pub struct Shifts {
-    // Right is false, left is true
+    /// Right is false, left is true
     direction: bool,
     shift_type: ShiftType,
     data: Either<(Size, Either<u8, DataReg>, DataReg), AddrMode>,
@@ -1596,7 +1596,6 @@ impl Instr for Shifts {
 
         if self.direction {
             match &self.shift_type {
-                // TODO: These are probably all wrong
                 ShiftType::Logical | ShiftType::Arithmetic => {
                     if self.direction {
                         cpu.core.ccr.set_carry(false);
@@ -1678,6 +1677,18 @@ impl Instr for Shifts {
                         cpu.core.ccr.set_carry(lsb);
                     }
                 }
+                ShiftType::Arithmetic => {
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_overflow(false);
+
+                    for _ in 0..amount {
+                        let lsb = value & 1 != 0;
+                        cpu.core.ccr.set_carry(lsb);
+                        cpu.core.ccr.set_extend(lsb);
+
+                        value = ((value as i32) >> 1) as u32;
+                    }
+                }
                 a => unimplemented!("Shift right {:?}", a),
             }
         }
@@ -1713,7 +1724,7 @@ impl TryFrom<u16> for Shifts {
                 data,
             })
         } else {
-            let size = Size::normal(raw_size);
+            let size = Size::normal(raw_size)?;
 
             let source = (data >> 9) as u8 & 0x7;
             let source = if data & (1 << 5) != 0 {
@@ -1765,7 +1776,7 @@ impl TryFrom<u16> for DivSubdOr {
         } else {
             let data_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let direction = (data >> 8) & 1 != 0;
-            let size = Size::normal((data >> 6) as u8 & 0x3);
+            let size = Size::normal((data >> 6) as u8 & 0x3)?;
             let mode = AddrMode::new(data as u8 & 0x3F);
 
             Ok(DivSubdOr::Or(data_reg, direction, size, mode))
@@ -1806,6 +1817,82 @@ impl Instr for DivSubdOr {
     }
 }
 
+#[derive(Debug)]
+pub struct MoveP {
+    addr_reg: AddrReg,
+    data_reg: DataReg,
+    /// False means memory to register,
+    /// true means register to memory.
+    direction: bool,
+    size: Size,
+}
+
+impl TryFrom<u16> for MoveP {
+    type Error = String;
+
+    fn try_from(data: u16) -> Result<Self, Self::Error> {
+        let top_nybble = data >> 12;
+        if top_nybble != 0b0000 {
+            return Err(format!("Invalid top nybble {:#b}", top_nybble));
+        }
+
+        let addr_reg = AddrReg::new(data as u8 & 0x7);
+        let size = Size::single_bit((data >> 6) & 1 != 0);
+        let direction = (data >> 7) & 1 != 0;
+        let data_reg = DataReg::new((data >> 9) as u8 & 0x7);
+
+        Ok(MoveP {
+            addr_reg,
+            data_reg,
+            direction,
+            size,
+        })
+    }
+}
+
+impl Instr for MoveP {
+    fn size(&self) -> u32 { 
+        4
+    }
+
+    fn execute(&self, cpu: &mut Cpu) {
+        let displacement = read_immediate(cpu, Size::Word);
+
+        let addr = displacement + self.addr_reg.read(cpu);
+
+        if self.direction {
+            // Register to memory
+            let result = MoveP::read_alt(addr, cpu, self.size);
+            self.data_reg.write_sized(result, self.size, cpu);
+        } else {
+            // Memory to register
+            if self.size == Size::Word {
+                MoveP::write_alt(&(self.data_reg.read(cpu) as u16).to_be_bytes(), addr, cpu);
+            } else {
+                MoveP::write_alt(&self.data_reg.read(cpu).to_be_bytes(), addr, cpu);
+            }
+        }
+    }
+}
+
+impl MoveP {
+    fn write_alt(data: &[u8], start_addr: u32, cpu: &mut Cpu) {
+        for (addr, byte) in data.iter().enumerate().map(|(i, b)| (i as u32 * 2 + start_addr, b)) {
+            cpu.write(addr, *byte as u32, Size::Byte);
+        }
+    }
+
+    fn read_alt(start_addr: u32, cpu: &mut Cpu, size: Size) -> u32 {
+        let mut result = 0;
+
+        for (i, addr) in (0..size.len()).map(|i| i as u32 * 2 + start_addr).enumerate() {
+            result |= cpu.read(addr, Size::Byte) << (8 * i);
+        }
+
+        result
+    }
+}
+
 // TODO: Implement these
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1835,7 +1922,7 @@ impl TryFrom<u16> for MulAddExgAnd {
         } else {
             let data_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let direction = (data >> 8) & 1 != 0;
-            let size = Size::normal((data >> 6) as u8 & 0x3);
+            let size = Size::normal((data >> 6) as u8 & 0x3)?;
             let mode = AddrMode::new(data as u8 & 0x3F);
 
             Ok(MulAddExgAnd::And(data_reg, direction, size, mode))

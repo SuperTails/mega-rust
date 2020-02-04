@@ -11,6 +11,7 @@ use vdp::Vdp;
 use std::sync::Arc;
 use std::sync::Mutex;
 use cpu::instruction::*;
+use std::collections::BinaryHeap;
 
 //const Z80_DATA: &[u8; 7110] = include_bytes!("../../z80decompressed.bin");
 
@@ -68,11 +69,15 @@ fn check_log(expected: &CpuCore, actual: &CpuCore) {
     assert_eq!(expected, actual);
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+/// The 68k has Interrupt Exceptions, over 3 pins: IPL0, IPL1, IPL2
+/// IPL register is in SR the low three bits of the high byte:
+/// xxxx xipl xxxx xxxx
+/// The 68k *ignores any exception equal to or below the current IPL level.*
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub enum Interrupt {
-    Vertical,
-    Horizontal,
-    External,
+    External = 2,
+    Horizontal = 4,
+    Vertical = 6,
 }
 
 pub struct Options {
@@ -83,9 +88,9 @@ pub fn run(cart: Cart, options: Options) {
     let vdp = Arc::new(Mutex::new(Vdp::new()));
     let mut cpu = Cpu::new(&cart.rom_data, Arc::downgrade(&vdp));
     let mut sdl_system = SDLSystem::new();
-    let mut hit_breakpoint = false;
+    let hit_breakpoint = false;
     let mut log_pos: Option<usize> = None;
-    let mut requested_int: Option<Interrupt> = None;
+    let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
     
     cpu::do_log(options.log_instrs);
 
@@ -150,7 +155,7 @@ pub fn run(cart: Cart, options: Options) {
 
         //let kos_data = [0xF3, 0xF3, 0xF3, 0x31, 0xFC, 0x1F];
 
-        let instr = Instruction::new(cpu.read(cpu.core.pc, Size::Word) as u16);
+        let _instr = Instruction::new(cpu.read(cpu.core.pc, Size::Word) as u16);
 
         /*if let Instruction { opcode: Pages::Immediates(Immediates{ op: SimpleOp::Or, .. }) } = instr {
             if cpu.read(cpu.core.pc + 2, &cpu::instruction::Size::Byte) == 0x40 {
@@ -166,11 +171,11 @@ pub fn run(cart: Cart, options: Options) {
             hit_breakpoint = true;
         }*/
 
-        cpu.do_cycle(&mut requested_int);
+        cpu.do_cycle(&mut pending);
         if vdp
             .lock()
             .unwrap()
-            .do_cycle(&mut sdl_system, &mut requested_int)
+            .do_cycle(&mut sdl_system, &mut pending)
         {
             println!("Exited with cpu core state:\n{}", cpu.core);
             break;
