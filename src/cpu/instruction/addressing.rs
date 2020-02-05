@@ -1,6 +1,6 @@
 use super::Size;
-use crate::cpu::Cpu;
 use crate::cpu::log_instr;
+use crate::cpu::Cpu;
 use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -106,6 +106,11 @@ impl AddrMode {
         } else {
             0
         };
+
+        self.address_offset(extra, cpu)
+    }
+
+    pub fn address_offset(self, extra: u32, cpu: &mut Cpu) -> Address {
         match self {
             AddrMode::AbsLong => Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Long)),
             AddrMode::AbsShort => {
@@ -137,12 +142,12 @@ impl AddrMode {
         }
     }
 
-    pub fn read(self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> u32 {
+    pub fn read_offset(self, immediate_offset: u32, size: Size, cpu: &mut Cpu) -> u32 {
         if let AddrMode::AddrPreDecr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
         }
-        let address = self.address(has_immediate, size, cpu);
+        let address = self.address_offset(immediate_offset, cpu);
         if let AddrMode::AddrPostIncr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_add(size.len() as u32);
@@ -150,12 +155,12 @@ impl AddrMode {
         address.read(size, cpu)
     }
 
-    pub fn write(self, value: u32, has_immediate: bool, size: Size, cpu: &mut Cpu) {
+    pub fn write_offset(self, value: u32, immediate_offset: u32, size: Size, cpu: &mut Cpu) {
         if let AddrMode::AddrPreDecr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
         }
-        let address = self.address(has_immediate, size, cpu);
+        let address = self.address_offset(immediate_offset, cpu);
         if let AddrMode::AddrPostIncr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_add(size.len() as u32);

@@ -1,4 +1,4 @@
-use super::{Ccr, Cpu, log_instr};
+use super::{log_instr, Ccr, Cpu};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
@@ -12,11 +12,7 @@ mod addressing;
 mod pages;
 
 fn read_immediate(cpu: &Cpu, size: Size) -> u32 {
-    let new_size = if size == Size::Byte {
-        Size::Word
-    } else {
-        size
-    };
+    let new_size = if size == Size::Byte { Size::Word } else { size };
 
     let result = cpu.read(cpu.core.pc + 2, new_size);
     if size == Size::Byte {
@@ -168,6 +164,14 @@ impl Size {
         }
     }
 
+    pub fn aligned_len(self) -> usize {
+        match self {
+            Size::Byte => 2,
+            Size::Word => 2,
+            Size::Long => 4,
+        }
+    }
+
     pub fn alignment(self) -> usize {
         match self {
             Size::Byte => 1,
@@ -311,7 +315,7 @@ impl Immediates {
         } else if self.use_sr() {
             (cpu.core.sr as u32) << 8 | (cpu.core.ccr.0 as u32)
         } else {
-            self.mode.read(true, self.size, cpu)
+            self.mode.read_offset(self.size.aligned_len() as u32, self.size, cpu)
         }
     }
 
@@ -322,7 +326,7 @@ impl Immediates {
             cpu.core.sr = (value >> 8) as u8;
             cpu.core.ccr.0 = value as u8;
         } else {
-            self.mode.write(value, true, self.size, cpu)
+            self.mode.write_offset(value, self.size.aligned_len() as u32, self.size, cpu)
         }
     }
 }
@@ -426,9 +430,15 @@ impl BitOperation {
         let shift_amount = shift_amount % self.shift_mod();
         let bit = 1 << shift_amount;
 
+        let immediate_len = if self.data_reg.is_some() {
+            0
+        } else {
+            2
+        };
+
         let mut value = self
             .mode
-            .read(self.data_reg.is_none(), self.data_size(), cpu);
+            .read_offset(immediate_len, self.data_size(), cpu);
         cpu.core.ccr.set_zero(value & bit == 0);
 
         match self.op_type {
@@ -439,7 +449,7 @@ impl BitOperation {
         }
 
         self.mode
-            .write(value, self.data_reg.is_none(), self.data_size(), cpu);
+            .write_offset(value, immediate_len, self.data_size(), cpu);
     }
 }
 
@@ -510,10 +520,10 @@ impl Instr for Miscellaneous {
                 Miscellaneous::unlink(*reg, cpu);
             }
             Miscellaneous::Neg(size, mode) => {
-                let mut value = mode.read(false, *size, cpu);
+                let mut value = mode.read_offset(0, *size, cpu);
                 cpu.core.ccr = compare(0, value, *size, false);
                 value = 0_u32.wrapping_sub(value);
-                mode.write(value, false, *size, cpu);
+                mode.write_offset(value, 0, *size, cpu);
             }
             Miscellaneous::Swap(reg) => {
                 let value = reg.read(cpu);
@@ -525,7 +535,7 @@ impl Instr for Miscellaneous {
             }
             Miscellaneous::Test(size, mode) => {
                 if let Some(size) = size {
-                    let value = mode.read(false, *size, cpu);
+                    let value = mode.read_offset(0, *size, cpu);
                     cpu.core.ccr.set_zero(value == 0);
                     cpu.core.ccr.set_overflow(false);
                     cpu.core.ccr.set_carry(false);
@@ -579,7 +589,7 @@ impl Instr for Miscellaneous {
                 }
             }
             Miscellaneous::Clear(size, addr_mode) => {
-                addr_mode.write(0, false, *size, cpu);
+                addr_mode.write_offset(0, 0, *size, cpu);
                 cpu.core.ccr.set_negative(false);
                 cpu.core.ccr.set_overflow(false);
                 cpu.core.ccr.set_carry(false);
@@ -599,23 +609,23 @@ impl Instr for Miscellaneous {
             }
             Miscellaneous::MoveFromSr(mode) => {
                 let value = (cpu.core.sr as u16) << 8 | cpu.core.ccr.0 as u16;
-                mode.write(value as u32, false, Size::Word, cpu);
+                mode.write_offset(value as u32, 0, Size::Word, cpu);
             }
             Miscellaneous::MoveToSr(mode) => {
-                let data = mode.read(false, Size::Word, cpu);
+                let data = mode.read_offset(0, Size::Word, cpu);
                 cpu.core.sr = (data >> 8) as u8;
                 cpu.core.ccr.0 = data as u8;
             }
             Miscellaneous::MoveToCcr(mode) => {
-                cpu.core.ccr.0 = mode.read(false, Size::Word, cpu) as u8;
+                cpu.core.ccr.0 = mode.read_offset(0, Size::Word, cpu) as u8;
             }
             Miscellaneous::Not(size, mode) => {
-                let result = !mode.read(false, *size, cpu);
+                let result = !mode.read_offset(0, *size, cpu);
                 cpu.core.ccr.set_overflow(false);
                 cpu.core.ccr.set_carry(false);
                 cpu.core.ccr.set_zero(result == 0);
                 cpu.core.ccr.set_negative_sized(result, *size);
-                mode.write(result, false, *size, cpu);
+                mode.write_offset(result, 0, *size, cpu);
             }
         }
     }
@@ -1010,7 +1020,7 @@ impl Instr for Move {
     }
 
     fn execute(&self, cpu: &mut Cpu) {
-        let value = self.from_mode.read(false, self.size, cpu);
+        let value = self.from_mode.read_offset(0, self.size, cpu);
 
         if let AddrMode::AddrReg(_) = self.to_mode {
             // Don't set flags for a MOVEA
@@ -1021,11 +1031,7 @@ impl Instr for Move {
             cpu.core.ccr.set_negative_sized(value, self.size);
         }
 
-        let has_immediate = if let AddrMode::Immediate = self.from_mode {
-            true
-        } else {
-            false
-        };
+        let offset = self.from_mode.arg_length(self.size);
 
         if let AddrMode::AddrReg(reg) = self.to_mode {
             let value_ext = if self.size == Size::Word {
@@ -1035,7 +1041,7 @@ impl Instr for Move {
             };
             AddrReg::new(reg).write(value_ext, cpu);
         } else {
-            self.to_mode.write(value, has_immediate, self.size, cpu);
+            self.to_mode.write_offset(value, offset, self.size, cpu);
         }
     }
 }
@@ -1188,9 +1194,13 @@ fn compare(dst: u32, src: u32, size: Size, is_add: bool) -> Ccr {
 impl LinearOp {
     pub fn do_op_carry(is_add: bool, dst: u32, src: u32, size: Size, carry: bool) -> (u32, Ccr) {
         let result = if is_add {
-            (dst & size.mask()).wrapping_add(src & size.mask()).wrapping_add(carry as u32)
+            (dst & size.mask())
+                .wrapping_add(src & size.mask())
+                .wrapping_add(carry as u32)
         } else {
-            (dst & size.mask()).wrapping_sub(src & size.mask()).wrapping_sub(carry as u32)
+            (dst & size.mask())
+                .wrapping_sub(src & size.mask())
+                .wrapping_sub(carry as u32)
         };
 
         let sized_result = (dst & !size.mask()) | (result & size.mask());
@@ -1273,40 +1283,54 @@ impl Instr for LinearOp {
         match &self.op_type {
             LinearOpType::Normal(dir, reg, mode) => {
                 let (dst, src) = if *dir {
-                    (mode.read(false, self.size, cpu), reg.read(cpu))
+                    (mode.read_offset(0, self.size, cpu), reg.read(cpu))
                 } else {
-                    (reg.read(cpu), mode.read(false, self.size, cpu))
+                    (reg.read(cpu), mode.read_offset(0, self.size, cpu))
                 };
 
                 let (result, ccr) = LinearOp::do_op(self.is_add, dst, src, self.size);
                 cpu.core.ccr = ccr;
 
                 if *dir {
-                    mode.write(result, false, self.size, cpu)
+                    mode.write_offset(result, 0, self.size, cpu)
                 } else {
                     reg.write(result, cpu)
                 }
             }
             LinearOpType::Address(reg, mode) => reg.write_sized(
-                reg.read(cpu) + mode.read(false, self.size, cpu),
+                reg.read(cpu) + mode.read_offset(0, self.size, cpu),
                 self.size,
                 cpu,
             ),
             LinearOpType::WithExtend(kind) => {
                 let (dst, src) = match kind {
-                    Either::Left((to, from)) => {
-                        (AddrMode::DataReg(to.into_inner()), AddrMode::DataReg(from.into_inner()))
-                    }
-                    Either::Right((to, from)) => {
-                        (AddrMode::AddrPreDecr(to.into_inner()), AddrMode::AddrPreDecr(from.into_inner()))
-                    }
+                    Either::Left((to, from)) => (
+                        AddrMode::DataReg(to.into_inner()),
+                        AddrMode::DataReg(from.into_inner()),
+                    ),
+                    Either::Right((to, from)) => (
+                        AddrMode::AddrPreDecr(to.into_inner()),
+                        AddrMode::AddrPreDecr(from.into_inner()),
+                    ),
                 };
 
-                let (result, mut ccr) = LinearOp::do_op_carry(self.is_add, dst.read(false, self.size, cpu), src.read(false, self.size, cpu), self.size, cpu.core.ccr.extend());
+                // We must only get the address once,
+                // so that the predecrement mode doesn't
+                // decrement twice.
+                let src_addr = src.address_offset(0, cpu);
+                let dst_addr = dst.address_offset(0, cpu);
+
+                let (result, mut ccr) = LinearOp::do_op_carry(
+                    self.is_add,
+                    dst_addr.read(self.size, cpu),
+                    src_addr.read(self.size, cpu),
+                    self.size,
+                    cpu.core.ccr.extend(),
+                );
                 ccr.set_zero(ccr.zero() | cpu.core.ccr.zero());
                 cpu.core.ccr = ccr;
 
-                dst.write(result, false, self.size, cpu);
+                dst_addr.write(result, self.size, cpu);
             }
         }
     }
@@ -1314,7 +1338,12 @@ impl Instr for LinearOp {
 
 #[derive(Debug)]
 pub enum ConditionsQuicks {
-    AddSubQ{ is_sub: bool, data: u8, size: Size, mode: AddrMode },
+    AddSubQ {
+        is_sub: bool,
+        data: u8,
+        size: Size,
+        mode: AddrMode,
+    },
     Set(Condition, AddrMode),
     DecBranch(Condition, DataReg),
 }
@@ -1322,7 +1351,7 @@ pub enum ConditionsQuicks {
 impl Instr for ConditionsQuicks {
     fn size(&self) -> u32 {
         2 + match self {
-            ConditionsQuicks::AddSubQ{ size, mode, .. } => mode.arg_length(*size),
+            ConditionsQuicks::AddSubQ { size, mode, .. } => mode.arg_length(*size),
             ConditionsQuicks::Set(_, mode) => mode.arg_length(Size::Byte),
             ConditionsQuicks::DecBranch(_, _) => 2,
         }
@@ -1330,11 +1359,16 @@ impl Instr for ConditionsQuicks {
 
     fn execute(&self, cpu: &mut Cpu) {
         match self {
-            ConditionsQuicks::AddSubQ{ is_sub, data, size, mode } => {
-            let dst = mode.read(false, *size, cpu);
+            ConditionsQuicks::AddSubQ {
+                is_sub,
+                data,
+                size,
+                mode,
+            } => {
+                let dst = mode.read_offset(0, *size, cpu);
                 let arg = if *data == 0 { 8 } else { *data };
                 let (result, ccr) = LinearOp::do_op(!is_sub, dst, arg as u32, *size);
-                mode.write(result, false, *size, cpu);
+                mode.write_offset(result, 0, *size, cpu);
                 if let AddrMode::AddrReg(_) = mode {
                     // Don't set flags
                 } else {
@@ -1371,7 +1405,7 @@ impl Instr for ConditionsQuicks {
                     0x00
                 };
 
-                mode.write(value, false, Size::Byte, cpu);
+                mode.write_offset(value, 0, Size::Byte, cpu);
             }
         }
     }
@@ -1402,7 +1436,12 @@ impl TryFrom<u16> for ConditionsQuicks {
             let is_sub = (data >> 8) & 1 != 0;
             let value = (data >> 9) as u8 & 7;
             let mode = AddrMode::new(data as u8 & 0x3F);
-            Ok(ConditionsQuicks::AddSubQ{ is_sub, data: value, size, mode })
+            Ok(ConditionsQuicks::AddSubQ {
+                is_sub,
+                data: value,
+                size,
+                mode,
+            })
         }
     }
 }
@@ -1480,14 +1519,14 @@ impl Instr for CompareEor {
             Either::Left(mode) => match mode {
                 CompareMode::Normal(dest_reg, source_mode) => {
                     let dest = dest_reg.read(cpu);
-                    let source = source_mode.read(false, self.size, cpu);
+                    let source = source_mode.read_offset(0, self.size, cpu);
                     let new_ccr = compare(dest, source, self.size, false);
                     cpu.core.ccr = new_ccr;
                 }
                 CompareMode::Address(dest_reg, source_mode) => {
                     // TODO: Make sure this is correct
                     let dest = dest_reg.read(cpu);
-                    let source = source_mode.read(false, self.size, cpu);
+                    let source = source_mode.read_offset(0, self.size, cpu);
                     let new_ccr = compare(dest, source, self.size, false);
                     cpu.core.ccr = new_ccr;
                 }
@@ -1495,7 +1534,7 @@ impl Instr for CompareEor {
             },
             Either::Right((reg, mode)) => {
                 let mut value = reg.read(cpu);
-                value ^= mode.read(false, self.size, cpu) & self.size.mask();
+                value ^= mode.read_offset(0, self.size, cpu) & self.size.mask();
                 reg.write(value, cpu);
 
                 cpu.core.ccr.set_zero(value == 0);
@@ -1556,7 +1595,7 @@ impl Shifts {
                 );
                 (shiftee.read(cpu), amount)
             }
-            Either::Right(mode) => (mode.read(false, Size::Word, cpu), 1),
+            Either::Right(mode) => (mode.read_offset(0, Size::Word, cpu), 1),
         }
     }
 
@@ -1574,7 +1613,7 @@ impl Shifts {
                 shiftee.write_sized(value, *size, cpu);
             }
             Either::Right(mode) => {
-                mode.write(value, false, Size::Word, cpu);
+                mode.write_offset(value, 0, Size::Word, cpu);
             }
         }
     }
@@ -1798,7 +1837,7 @@ impl Instr for DivSubdOr {
             DivSubdOr::Div(_, _, _) => unimplemented!(),
             DivSubdOr::Subd(_, _) => unimplemented!(),
             DivSubdOr::Or(data_reg, direction, size, mode) => {
-                let arg = mode.read(false, *size, cpu);
+                let arg = mode.read_offset(0, *size, cpu);
                 let result = data_reg.read(cpu) | arg;
 
                 cpu.core.ccr.set_negative_sized(result, *size);
@@ -1807,7 +1846,7 @@ impl Instr for DivSubdOr {
                 cpu.core.ccr.set_carry(false);
 
                 if *direction {
-                    mode.write(result, false, *size, cpu);
+                    mode.write_offset(result, 0, *size, cpu);
                 } else {
                     let mask = size.mask();
                     data_reg.write((result & mask) | (data_reg.read(cpu) & !mask), cpu);
@@ -1851,7 +1890,7 @@ impl TryFrom<u16> for MoveP {
 }
 
 impl Instr for MoveP {
-    fn size(&self) -> u32 { 
+    fn size(&self) -> u32 {
         4
     }
 
@@ -1877,7 +1916,11 @@ impl Instr for MoveP {
 
 impl MoveP {
     fn write_alt(data: &[u8], start_addr: u32, cpu: &mut Cpu) {
-        for (addr, byte) in data.iter().enumerate().map(|(i, b)| (i as u32 * 2 + start_addr, b)) {
+        for (addr, byte) in data
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as u32 * 2 + start_addr, b))
+        {
             cpu.write(addr, *byte as u32, Size::Byte);
         }
     }
@@ -1885,7 +1928,10 @@ impl MoveP {
     fn read_alt(start_addr: u32, cpu: &mut Cpu, size: Size) -> u32 {
         let mut result = 0;
 
-        for (i, addr) in (0..size.len()).map(|i| i as u32 * 2 + start_addr).enumerate() {
+        for (i, addr) in (0..size.len())
+            .map(|i| i as u32 * 2 + start_addr)
+            .enumerate()
+        {
             result |= cpu.read(addr, Size::Byte) << (8 * i);
         }
 
@@ -1897,8 +1943,7 @@ impl MoveP {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum MulAddExgAnd {
-    // True means signed
-    Mul(bool, DataReg, AddrMode),
+    Mul{ signed: bool, op1: DataReg, op2: AddrMode },
     Abcd,
     Exchange,
     And(DataReg, bool, Size, AddrMode),
@@ -1916,7 +1961,14 @@ impl TryFrom<u16> for MulAddExgAnd {
         if (data >> 4) & 0x1F == 0b1_00_00 {
             unimplemented!("Abcd")
         } else if (data >> 6) & 0x3 == 0b11 {
-            unimplemented!("Mulu and Muls")
+            let signed = (data >> 8) & 1 != 0;
+            let op2 = AddrMode::new(data as u8 & 0x3F);
+            let op1 = DataReg::new((data >> 9) as u8 & 0x7);
+            Ok(MulAddExgAnd::Mul {
+                signed,
+                op1,
+                op2,
+            })
         } else if bitpat!(1 _ _ 0 0)(data >> 4) {
             unimplemented!("Exchange")
         } else {
@@ -1934,6 +1986,7 @@ impl Instr for MulAddExgAnd {
     fn size(&self) -> u32 {
         match self {
             MulAddExgAnd::And(_, _, size, mode) => 2 + mode.arg_length(*size),
+            MulAddExgAnd::Mul{ op2, .. } => 2 + op2.arg_length(Size::Word),
             _ => unimplemented!(),
         }
     }
@@ -1941,7 +1994,7 @@ impl Instr for MulAddExgAnd {
     fn execute(&self, cpu: &mut Cpu) {
         match self {
             MulAddExgAnd::And(data_reg, direction, size, mode) => {
-                let arg = mode.read(false, *size, cpu);
+                let arg = mode.read_offset(0, *size, cpu);
                 let result = data_reg.read(cpu) & arg;
 
                 cpu.core.ccr.set_negative_sized(result, *size);
@@ -1950,10 +2003,26 @@ impl Instr for MulAddExgAnd {
                 cpu.core.ccr.set_carry(false);
 
                 if *direction {
-                    mode.write(result, false, *size, cpu);
+                    mode.write_offset(result, 0, *size, cpu);
                 } else {
                     let mask = size.mask();
                     data_reg.write((result & mask) | (data_reg.read(cpu) & !mask), cpu);
+                }
+            }
+            MulAddExgAnd::Mul{ signed, op1, op2 } => {
+                if *signed {
+                    todo!("Signed multiply")
+                } else {
+                    let val1 = op1.read(cpu);
+                    let val2 = op2.read_offset(0, Size::Word, cpu);
+                    let result = val1 * val2;
+                    op1.write(result, cpu);
+
+                    // Multiplication can't overflow on the 68000
+                    cpu.core.ccr.set_overflow(false);
+                    cpu.core.ccr.set_carry(false);
+                    cpu.core.ccr.set_zero(result == 0);
+                    cpu.core.ccr.set_negative_sized(result, Size::Long);
                 }
             }
             _ => unimplemented!(),

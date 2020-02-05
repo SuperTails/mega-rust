@@ -6,8 +6,8 @@ use bitfield::bitfield;
 use bitpat::bitpat;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
-use std::convert::TryFrom;
 use std::collections::BinaryHeap;
+use std::convert::TryFrom;
 
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:
@@ -324,9 +324,9 @@ impl Vdp {
                     }
                 };
 
-                let addr_z = cell * 2 + self.window_nametable;
-                let addr_a = cell * 2 + self.plane_a_nametable;
-                let addr_b = cell * 2 + self.plane_b_nametable;
+                let addr_z = self.window_nametable.wrapping_add(cell * 2);
+                let addr_a = self.plane_a_nametable.wrapping_add(cell * 2);
+                let addr_b = self.plane_b_nametable.wrapping_add(cell * 2);
 
                 let color_z = get_color(addr_z);
                 let color_a = get_color(addr_a);
@@ -421,20 +421,23 @@ impl Vdp {
 
     // 262 line range
     // 342 pixel range
-    pub fn do_cycle(&mut self, sdl_system: &mut SDLSystem, int: &mut BinaryHeap<Interrupt>) -> bool {
+    pub fn do_cycle(
+        &mut self,
+        sdl_system: &mut SDLSystem,
+        int: &mut BinaryHeap<Interrupt>,
+    ) -> bool {
         self.cycle += 1;
 
         // TODO: It should be 488.5 I think,
         // and the CPU definitely does *not* take only one cycle to execute each instruction
         //
         // TODO: But it only has a 342 pixel range!
-        if self.cycle % 489 == 0 {
+        let result = if self.cycle % 488 == 0 {
             // One scanline has finished
             self.scanline += 1;
-            // TODO: Horizontal interrupts
-
             if self.horiz_int_counter == 0 {
-                if self.mode1.horiz_interrupt() && !int.iter().any(|i| i == &Interrupt::Horizontal) {
+                if self.mode1.horiz_interrupt() && !int.iter().any(|i| i == &Interrupt::Horizontal)
+                {
                     int.push(Interrupt::Horizontal);
                 }
 
@@ -442,32 +445,25 @@ impl Vdp {
             } else {
                 self.horiz_int_counter -= 1;
             }
-        }
+
+            true
+        } else {
+            false
+        };
 
         // TODO: This might not be correct
         if self.scanline == 262 {
-            self.scanline = 0;
             // One frame has finished
+            self.scanline = 0;
 
             if self.mode2.vert_interrupt() && !int.iter().any(|i| i == &Interrupt::Vertical) {
                 int.push(Interrupt::Vertical);
             }
 
             self.render(sdl_system);
-
-            for event in sdl_system.event_pump.poll_iter() {
-                match event {
-                    sdl2::event::Event::KeyDown {
-                        keycode: Some(sdl2::keyboard::Keycode::Escape),
-                        ..
-                    }
-                    | sdl2::event::Event::Quit { .. } => return true,
-                    _ => {}
-                }
-            }
         }
 
-        false
+        result
     }
 
     pub fn read(&mut self, addr: u32) -> u16 {
@@ -477,7 +473,7 @@ impl Vdp {
         self.write_pending = None;
 
         // *roughly* maps 489 cycles to 342 pixels
-        let pixel = (self.cycle % 489) * 7 / 10;
+        let pixel = (self.cycle % 488) * 703 / 1_000;
 
         match reg {
             Register::StatusControl => {
@@ -494,6 +490,7 @@ impl Vdp {
                 result
             }
             Register::HVCounter => {
+                println!("Cycle: {}", self.cycle);
                 let jumped_pixel = u8::try_from(if pixel <= 0xE9 {
                     pixel
                 } else {
@@ -510,9 +507,27 @@ impl Vdp {
 
                 ((jumped_scanline as u16) << 8) | jumped_pixel as u16
             }
-            _ => {
-                println!("Returning 0 from read to {:?}", reg);
-                0
+            Register::Data => {
+                let (address, is_write, ram_type) = self.ram_address;
+                let result = if !is_write {
+                    match ram_type {
+                        RamMode::VRam => {
+                            ((self.vram[address as usize] as u16) << 8)
+                                | self.vram[address as usize + 1] as u16
+                        }
+                        RamMode::CRam => self.cram[address as usize / 2].0,
+                        RamMode::VSRam => {
+                            let address = (address & 0x4F) / 2;
+                            self.vsram[address as usize] & 0x3FF
+                        }
+                    }
+                } else {
+                    panic!("Ignoring read from data register");
+                };
+
+                self.ram_address.0 = self.ram_address.0.wrapping_add(self.auto_increment as u16);
+
+                result
             }
         }
     }
@@ -606,8 +621,21 @@ impl Vdp {
                 self.plane_width = decode_size(value & 0x3);
                 self.plane_height = decode_size((value >> 4) & 0x3);
             }
-            0x11 => assert_eq!(value, 0, "Nonzero window plane horizontal position"),
-            0x12 => assert_eq!(value, 0, "Nonzero window plane vertical position"),
+            0x11 => {
+                // TODO:
+                if value != 0 {
+                    println!(
+                        "IGNORING NONZERO WINDOW PLANE HORIZONTAL POSITION {}",
+                        value
+                    )
+                }
+            }
+            0x12 => {
+                // TODO:
+                if value != 0 {
+                    println!("IGNORING NONZERO WINDOW PLANE VERTICAL POSITION {}", value)
+                }
+            }
             0x13 => {
                 self.dma_length &= 0xFF_00;
                 self.dma_length |= value as u16;
@@ -646,7 +674,10 @@ impl Vdp {
                 println!("DMA source is now {:#X}", self.dma_target.0);
             }
             _ => {
-                println!("TODO: Ignoring write of {:#X} to register {:#X}", value, index);
+                println!(
+                    "TODO: Ignoring write of {:#X} to register {:#X}",
+                    value, index
+                );
             }
         }
     }

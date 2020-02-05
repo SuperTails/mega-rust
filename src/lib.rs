@@ -1,17 +1,19 @@
 pub mod cart;
+mod controller;
 mod cpu;
 mod joypad;
 mod sdl_system;
 mod vdp;
 
 use cart::Cart;
+use controller::Controller;
+use cpu::instruction::*;
 use cpu::{Cpu, CpuCore};
 use sdl_system::SDLSystem;
-use vdp::Vdp;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use cpu::instruction::*;
-use std::collections::BinaryHeap;
+use vdp::Vdp;
 
 //const Z80_DATA: &[u8; 7110] = include_bytes!("../../z80decompressed.bin");
 
@@ -86,37 +88,26 @@ pub struct Options {
 
 pub fn run(cart: Cart, options: Options) {
     let vdp = Arc::new(Mutex::new(Vdp::new()));
-    let mut cpu = Cpu::new(&cart.rom_data, Arc::downgrade(&vdp));
+    let controller1 = Arc::new(Mutex::new(Controller::default()));
+    let controller2 = Arc::new(Mutex::new(Controller::default()));
+    let mut cpu = Cpu::new(
+        &cart.rom_data,
+        Arc::downgrade(&vdp),
+        Arc::downgrade(&controller1),
+        Arc::downgrade(&controller2),
+    );
     let mut sdl_system = SDLSystem::new();
     let hit_breakpoint = false;
     let mut log_pos: Option<usize> = None;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
-    
+
     cpu::do_log(options.log_instrs);
 
     let log =
         CpuCore::read_log(&std::fs::read_to_string("./roms/s1disasm/s1rev01_RunLog.txt").unwrap())
             .unwrap();
-            
-    //let kos_data = kos_decompress(&cpu.rom[0x72E7C..]).unwrap();
-    //let kos_data = parse_thing("F3 F3 F3 31 FC 1F DD 21 0 40 AF 32 FD FF 32 FF 1F 3E");
-    //cpu.ram[0x18B2] = 0x4E;
-    //cpu.ram[0x18B3] = 0x75;
 
-    loop {
-        /*if cpu.core.pc == 0xC254
-        || cpu.core.pc == 0x173E
-        || (cpu.core.pc >> 8 == 0x17 && cpu.core.addr[1] >> 16 != 0xFF)
-        || cpu.core.pc == 0x30C {
-            hit_breakpoint = true;
-        }*/
-        /*if cpu.core.pc == 0x1716 {
-            log_pos = Some(0);
-
-            cpu.core = log[0].clone();
-        }*/
-
-
+    'running: loop {
         if hit_breakpoint {
             'wait: loop {
                 for event in sdl_system.event_pump.poll_iter() {
@@ -153,32 +144,32 @@ pub fn run(cart: Cart, options: Options) {
             }
         }
 
-        //let kos_data = [0xF3, 0xF3, 0xF3, 0x31, 0xFC, 0x1F];
-
         let _instr = Instruction::new(cpu.read(cpu.core.pc, Size::Word) as u16);
 
-        /*if let Instruction { opcode: Pages::Immediates(Immediates{ op: SimpleOp::Or, .. }) } = instr {
-            if cpu.read(cpu.core.pc + 2, &cpu::instruction::Size::Byte) == 0x40 {
-                hit_breakpoint = true;
-            }
-        }
-
-        /*if let Instruction { opcode: Pages::Miscellaneous(Miscellaneous::Clear(Size::Byte, _)) } = instr {
-            hit_breakpoint = true;
-        }*/
-
-        if cpu.core.pc == 0x2E66 {
-            hit_breakpoint = true;
-        }*/
-
         cpu.do_cycle(&mut pending);
-        if vdp
-            .lock()
-            .unwrap()
-            .do_cycle(&mut sdl_system, &mut pending)
-        {
-            println!("Exited with cpu core state:\n{}", cpu.core);
-            break;
+        if vdp.lock().unwrap().do_cycle(&mut sdl_system, &mut pending) {
+            let events: Vec<_> = sdl_system.event_pump.poll_iter().collect();
+            controller1.lock().unwrap().update_buttons(&events);
+            controller2.lock().unwrap().update_buttons(&events);
+            for event in events {
+                match event {
+                    sdl2::event::Event::KeyDown {
+                        keycode: Some(sdl2::keyboard::Keycode::Escape),
+                        ..
+                    }
+                    | sdl2::event::Event::Quit { .. } => {
+                        println!("Exited with cpu core state:\n{}", cpu.core);
+                        break 'running;
+                    }
+                    sdl2::event::Event::KeyDown {
+                        keycode: Some(sdl2::keyboard::Keycode::L),
+                        ..
+                    } => {
+                        cpu::do_log(true);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         if cpu::log_instr() {

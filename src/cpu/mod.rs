@@ -1,16 +1,17 @@
 pub mod instruction;
+use crate::controller::Controller;
 use crate::get_four_bytes;
 use crate::get_two_bytes;
 use crate::vdp::Vdp;
 use crate::Interrupt;
 use bitfield::bitfield;
 use instruction::{Instruction, Size};
+use lazy_static::lazy_static;
+use std::collections::BinaryHeap;
 use std::fmt;
 use std::io::Write;
-use std::sync::{Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::BinaryHeap;
-use lazy_static::lazy_static;
+use std::sync::{Mutex, Weak};
 
 lazy_static! {
     static ref LOG_INSTR: AtomicBool = AtomicBool::new(false);
@@ -62,7 +63,11 @@ pub enum State {
 impl fmt::Display for CpuCore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "======== CPU Core State =========")?;
-        writeln!(f, "PC: {:#06X} USP: {:#06X}, CCR: {}", self.pc, self.usp, self.ccr)?;
+        writeln!(
+            f,
+            "PC: {:#06X} USP: {:#06X}, CCR: {}",
+            self.pc, self.usp, self.ccr
+        )?;
         writeln!(f, "------------- Registers ---------")?;
         for (idx, (d, a)) in self.data.iter().zip(self.addr.iter()).enumerate() {
             writeln!(f, "d{}/a{} | {:#010X} | {:#010X}", idx, idx, d, a)?;
@@ -93,10 +98,17 @@ pub struct Cpu {
     pub ram: [u8; 0x1_0000],
     pub z80_ram: [u8; 0x1_0000],
     vdp: Weak<Mutex<Vdp>>,
+    controller1: Weak<Mutex<Controller>>,
+    controller2: Weak<Mutex<Controller>>,
 }
 
 impl Cpu {
-    pub fn new(rom: &[u8], vdp: Weak<Mutex<Vdp>>) -> Cpu {
+    pub fn new(
+        rom: &[u8],
+        vdp: Weak<Mutex<Vdp>>,
+        controller1: Weak<Mutex<Controller>>,
+        controller2: Weak<Mutex<Controller>>,
+    ) -> Cpu {
         let rom: Box<[u8]> = rom.into();
         let cart_ram = {
             let mut cart_ram = Vec::new();
@@ -111,6 +123,8 @@ impl Cpu {
             ram: [0; 0x1_0000],
             z80_ram: [0; 0x1_0000],
             vdp,
+            controller1,
+            controller2,
         }
     }
 
@@ -133,8 +147,15 @@ impl Cpu {
         }
 
         if addr == 0xA1_0003 || addr == 0xA1_0004 {
-            println!("Returning 0 from controller 1 read");
-            return 0;
+            assert_eq!(size, Size::Byte);
+            let controller1 = self.controller1.upgrade().unwrap();
+            return controller1.lock().unwrap().read_reg1() as u32;
+        }
+
+        if addr == 0xA1_0005 || addr == 0xA1_0006 {
+            assert_eq!(size, Size::Byte);
+            let controller2 = self.controller2.upgrade().unwrap();
+            return controller2.lock().unwrap().read_reg1() as u32;
         }
 
         if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
@@ -189,7 +210,14 @@ impl Cpu {
 
         match addr {
             0xA1_0003..=0xA1_0004 => {
-                println!("Ignoring write to controller 1");
+                let controller1 = self.controller1.upgrade().unwrap();
+                controller1.lock().unwrap().write_reg1(value as u8);
+                return;
+            }
+            0xA1_0009..=0xA1_000A => {
+                assert_eq!(size, Size::Byte);
+                let controller1 = self.controller1.upgrade().unwrap();
+                controller1.lock().unwrap().write_reg2(value as u8);
                 return;
             }
             0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
@@ -299,13 +327,10 @@ impl Cpu {
                     if *int as u8 > mask_level {
                         let int = pending.pop().unwrap();
                         match int {
-                            Interrupt::External if mask_level < 2 => {
+                            Interrupt::External => {
                                 unimplemented!("External interrupt");
                             }
-                            Interrupt::Horizontal if mask_level < 4 => {
-                                unimplemented!("Horizontal interrupt");
-                            }
-                            Interrupt::Vertical if mask_level < 6 => {
+                            Interrupt::Horizontal => {
                                 // TODO: This should use the SSP instead of A7 I think
                                 self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
                                 self.write(self.core.addr[7], self.core.pc, Size::Long);
@@ -316,13 +341,31 @@ impl Cpu {
                                     Size::Word,
                                 );
 
-                                let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
+                                let vector =
+                                    u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
+
+                                self.core.sr = 4;
+                                self.core.pc = vector;
+                                println!("Did horizontal interrupt");
+                            }
+                            Interrupt::Vertical => {
+                                // TODO: This should use the SSP instead of A7 I think
+                                self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
+                                self.write(self.core.addr[7], self.core.pc, Size::Long);
+                                self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
+                                self.write(
+                                    self.core.addr[7],
+                                    ((self.core.sr as u32) << 8) | self.core.ccr.0 as u32,
+                                    Size::Word,
+                                );
+
+                                let vector =
+                                    u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
 
                                 self.core.sr = 6;
                                 self.core.pc = vector;
                                 println!("Did vertical interrupt");
                             }
-                            _ => {}
                         }
                     }
                 }

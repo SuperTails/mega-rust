@@ -39,7 +39,6 @@ macro_rules! make_dispatcher {
     };
 }
 
-
 make_dispatcher! { Pages :
     Immediates, // First half of 0b0000
     BitOperation, // Other half of 0b0000
