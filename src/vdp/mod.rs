@@ -3,11 +3,74 @@ use crate::cpu::Cpu;
 use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
 use bitfield::bitfield;
-use bitpat::bitpat;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
 use std::collections::BinaryHeap;
+use bus::Bus;
+use std::ops::{Deref, DerefMut};
 use std::convert::TryFrom;
+
+mod bus;
+
+#[derive(Debug)]
+struct AccessType {
+    pub address: u16,
+    pub write: bool,
+    pub ram_type: RamMode,
+}
+
+impl AccessType {
+    pub fn new() -> AccessType {
+        AccessType {
+            address: 0,
+            write: false,
+            ram_type: RamMode::VRam,
+        }
+    }
+
+    pub fn write(&mut self, value: u16, vram: &mut [u8], cram: &mut [CRamEntry], vsram: &mut [u16], increment: u16) {
+        if self.write {
+            match self.ram_type {
+                RamMode::VRam => {
+                    vram[self.address as usize..][0..2].copy_from_slice(&value.to_be_bytes())
+                }
+                RamMode::CRam => cram[self.address as usize / 2].0 = value,
+                RamMode::VSRam => {
+                    let address = (self.address & 0x4F) / 2;
+                    let value = value & 0x3FF;
+
+                    vsram[address as usize] = value;
+                }
+            }
+        } else {
+            panic!("Ignoring write of {:#X} to data register", value);
+        }
+
+        self.address = self.address.wrapping_add(increment);
+    }
+
+    pub fn read(&mut self, vram: &[u8], cram: &[CRamEntry], vsram: &[u16], increment: u16) -> u16 {
+        let result = if !self.write {
+            match self.ram_type {
+                RamMode::VRam => {
+                    ((vram[self.address as usize] as u16) << 8)
+                        | vram[self.address as usize + 1] as u16
+                }
+                RamMode::CRam => cram[self.address as usize / 2].0,
+                RamMode::VSRam => {
+                    let address = (self.address & 0x4F) / 2;
+                    vsram[address as usize] & 0x3FF
+                }
+            }
+        } else {
+            panic!("Attempt to read from VDP when in write mode")
+        };
+
+        self.address = self.address.wrapping_add(increment);
+
+        result
+    }
+}
 
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:
@@ -20,9 +83,9 @@ use std::convert::TryFrom;
 /// 40x10bits VSRAM: Used to store vertical scroll data
 ///
 /// Information from segaretro.org
-pub struct Vdp {
+pub struct VdpInner {
     // True means write
-    ram_address: (u16, bool, RamMode),
+    ram_address: AccessType,
     mode1: VdpMode1,
     mode2: VdpMode2,
 
@@ -32,7 +95,8 @@ pub struct Vdp {
     dma_mode: DmaMode,
     fill_pending: bool,
 
-    write_pending: Option<u16>,
+    window_horizontal: u16,
+    window_vertical: u16,
 
     /// Address in VRAM of the beginning of the nametable
     /// for plane A.
@@ -73,6 +137,11 @@ pub struct Vdp {
 
     // 40 10-bit entries
     vsram: [u16; 40],
+}
+
+pub struct Vdp {
+    inner: VdpInner,
+    bus: Bus,
 }
 
 #[derive(Debug, PartialEq)]
@@ -239,22 +308,21 @@ bitfield! {
     priority, _: 15;
 }
 
-impl Vdp {
-    pub fn new() -> Vdp {
+impl VdpInner {
+    pub fn new() -> VdpInner {
         let mut vram = [0; 0x1_00_00];
         for (i, e) in vram.iter_mut().enumerate() {
             *e = i as u8;
         }
 
-        Vdp {
-            ram_address: (0, false, RamMode::VRam),
+        VdpInner {
+            ram_address: AccessType::new(),
             mode1: VdpMode1(0),
             mode2: VdpMode2(0),
             dma_length: 0,
             dma_target: (0, RamMode::VRam),
             dma_mode: DmaMode::VramFill,
             fill_pending: false,
-            write_pending: None,
             plane_a_nametable: 0,
             plane_b_nametable: 0,
             window_nametable: 0,
@@ -267,6 +335,8 @@ impl Vdp {
             scanline: 0,
             horiz_int_period: 0,
             horiz_int_counter: 0,
+            window_horizontal: 0,
+            window_vertical: 0,
             dma_source: 0,
             cycle: 0,
             auto_increment: 0,
@@ -292,12 +362,9 @@ impl Vdp {
                 let cell_row = row / 8;
                 let cell_col = col / 8;
 
-                let pixel_row = row % 8;
-                let pixel_col = col % 8;
-
                 let cell = cell_row * plane_cell_width + cell_col;
 
-                let get_color = |addr: u16| -> Option<(u8, u8, u8)> {
+                let get_color = |addr: u16, window: bool| -> Option<(u8, u8, u8)> {
                     let tile_entry = self.get_tile_entry(addr);
 
                     let tile_addr = tile_entry.tile_index() as usize * 0x20;
@@ -306,6 +373,18 @@ impl Vdp {
                     let tile = &self.vram[tile_addr..][0..0x20];
 
                     const BYTES_PER_ROW: usize = 4;
+
+                    let pixel_row = if window {
+                        (row + self.window_vertical)
+                    } else {
+                        row
+                    } % 8;
+
+                    let pixel_col = if window {
+                        (col + self.window_horizontal)
+                    } else {
+                        col
+                    } % 8;
 
                     let data_row = &tile[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
                     let pixel_byte = data_row[pixel_col as usize / 2];
@@ -328,9 +407,9 @@ impl Vdp {
                 let addr_a = self.plane_a_nametable.wrapping_add(cell * 2);
                 let addr_b = self.plane_b_nametable.wrapping_add(cell * 2);
 
-                let color_z = get_color(addr_z);
-                let color_a = get_color(addr_a);
-                let color_b = get_color(addr_b);
+                let color_z = get_color(addr_z, true);
+                let color_a = get_color(addr_a, false);
+                let color_b = get_color(addr_b, false);
 
                 let overall_color = if let Some(c) = color_a {
                     c
@@ -465,70 +544,71 @@ impl Vdp {
 
         result
     }
-
-    pub fn read(&mut self, addr: u32) -> u16 {
-        let reg = Register::decode(addr & !0x1).unwrap();
-
-        // TODO: I think this works?
-        self.write_pending = None;
-
+    
+    // TODO: Make this correct
+    pub fn get_pixel(&self) -> u16 {
         // *roughly* maps 489 cycles to 342 pixels
-        let pixel = (self.cycle % 488) * 703 / 1_000;
+        ((self.cycle % 488) * 703 / 1_000) as u16
+    }
 
-        match reg {
-            Register::StatusControl => {
-                let vblank_bit = self.scanline > 224;
-                let hblank_bit = pixel > 256;
-                // TODO: Everything else
+    pub fn get_hv_counter(&self) -> u16 {
+        let pixel = self.get_pixel();
 
-                let result = (1 << 9) | // Always show FIFO as being empty
-                    ((vblank_bit as u16) << 3) |
-                    ((hblank_bit as u16) << 2);
+        println!("Cycle: {}", self.cycle);
+        let jumped_pixel = u8::try_from(if pixel <= 0xE9 {
+            pixel
+        } else {
+            (pixel - 0xEA) + 0x93
+        })
+        .unwrap();
 
-                println!("Returning {:#X} from status register", result);
+        let jumped_scanline = u8::try_from(if self.scanline <= 0xEA {
+            self.scanline
+        } else {
+            (self.scanline - 0xEB) + 0xE5
+        })
+        .unwrap();
 
-                result
+        ((jumped_scanline as u16) << 8) | jumped_pixel as u16
+    }
+
+    pub fn get_status(&self) -> u16 {
+        let pixel = self.get_pixel();
+
+        let vblank_bit = self.scanline > 224;
+        let hblank_bit = pixel > 256;
+        // TODO: Everything else
+
+        (1 << 9) | // Always show FIFO as being empty
+            ((vblank_bit as u16) << 3) |
+            ((hblank_bit as u16) << 2)
+    }
+
+    pub fn cpu_copy(&mut self, cpu: &mut Cpu) {
+        // TODO: Why????
+        if self.dma_source >> 16 == 0x7F {
+            self.dma_source |= 0x80_00_00
+        }
+        // TODO: This may not be correct
+        match self.dma_target {
+            (addr, RamMode::VRam) => {
+                println!("CPU to VRAM DMA with length {:#X}", self.dma_length);
+                for i in 0..self.dma_length {
+                    self.vram[(addr + i) as usize] =
+                        cpu.read(self.dma_source + i as u32, Size::Byte) as u8;
+                }
             }
-            Register::HVCounter => {
-                println!("Cycle: {}", self.cycle);
-                let jumped_pixel = u8::try_from(if pixel <= 0xE9 {
-                    pixel
-                } else {
-                    (pixel - 0xEA) + 0x93
-                })
-                .unwrap();
-
-                let jumped_scanline = u8::try_from(if self.scanline <= 0xEA {
-                    self.scanline
-                } else {
-                    (self.scanline - 0xEB) + 0xE5
-                })
-                .unwrap();
-
-                ((jumped_scanline as u16) << 8) | jumped_pixel as u16
+            (addr, RamMode::CRam) => {
+                println!("CPU to CRAM DMA with length {:#X}", self.dma_length);
+                // TODO: Am I supposed to mask the DMA length like this...?
+                for i in 0..((self.dma_length & 0xFF) / 2) {
+                    // TODO: This may be somewhat off, also CRAM and VSRAM uses word wide
+                    // reads I believe
+                    self.cram[(addr / 2 + i) as usize].0 =
+                        cpu.read(self.dma_source + i as u32 * 2, Size::Word) as u16;
+                }
             }
-            Register::Data => {
-                let (address, is_write, ram_type) = self.ram_address;
-                let result = if !is_write {
-                    match ram_type {
-                        RamMode::VRam => {
-                            ((self.vram[address as usize] as u16) << 8)
-                                | self.vram[address as usize + 1] as u16
-                        }
-                        RamMode::CRam => self.cram[address as usize / 2].0,
-                        RamMode::VSRam => {
-                            let address = (address & 0x4F) / 2;
-                            self.vsram[address as usize] & 0x3FF
-                        }
-                    }
-                } else {
-                    panic!("Ignoring read from data register");
-                };
-
-                self.ram_address.0 = self.ram_address.0.wrapping_add(self.auto_increment as u16);
-
-                result
-            }
+            _ => todo!("CPU to VDP destination {:?}", self.dma_target),
         }
     }
 
@@ -564,276 +644,35 @@ impl Vdp {
             self.vram[self.dma_target.0 as usize + i] = self.vram[self.dma_source as usize + i];
         }
     }
+}
 
-    // TODO: See the other one below!!
-    #[allow(clippy::redundant_closure_call)]
-    pub fn set_internal_reg(&mut self, value: u8, index: usize) {
-        match index {
-            0x00 => self.mode1.0 = value,
-            0x01 => self.mode2.0 = value,
-            0x02 => self.plane_a_nametable = value as u16 * 0x0400,
-            0x03 => self.window_nametable = value as u16 * 0x400,
-            0x04 => self.plane_b_nametable = value as u16 * 0x2000,
-            0x05 => self.sprite_table_addr = value as u16 * 0x200,
-            0x06 => assert_eq!(value, 0, "Nonzero bit 16 of sprite table address"),
-            0x07 => self.bg_color = value,
-            0x08 => {
-                if value != 0 {
-                    println!(
-                        "Ignoring non-zero master system horizontal scroll write {:#X}",
-                        value
-                    )
-                }
-            }
-            0x09 => {
-                if value != 0 {
-                    println!(
-                        "Ignoring non-zero master system vertical scroll write {:#X}",
-                        value
-                    )
-                }
-            }
-            0x0A => self.horiz_int_period = value,
-            0x0B => println!("Ignoring write of {:#X} to VDP mode register 3", value),
-            0x0C => println!("Ignoring write of {:#X} to VDP mode register 4", value),
-            0x0D => self.horiz_scroll_addr = value as u16 * 0x400,
-            0x0E => assert_eq!(value, 0, "Nonzero bit 16"),
-            0x0F => {
-                self.auto_increment = value;
-                println!("Auto incr is now {:#X}", self.auto_increment)
-            }
-            0x10 => {
-                // 00 =>  256
-                // 01 =>  512
-                // 11 => 1024
-
-                let decode_size = |bits: u8| -> u16 {
-                    match bits {
-                        0b00 => 256,
-                        0b01 => 512,
-                        0b11 => 1024,
-                        0b10 => panic!("Invalid plane size"),
-                        _ => unreachable!(),
-                    }
-                };
-
-                // TODO: Why is this lint firing??
-                self.plane_width = decode_size(value & 0x3);
-                self.plane_height = decode_size((value >> 4) & 0x3);
-            }
-            0x11 => {
-                // TODO:
-                if value != 0 {
-                    println!(
-                        "IGNORING NONZERO WINDOW PLANE HORIZONTAL POSITION {}",
-                        value
-                    )
-                }
-            }
-            0x12 => {
-                // TODO:
-                if value != 0 {
-                    println!("IGNORING NONZERO WINDOW PLANE VERTICAL POSITION {}", value)
-                }
-            }
-            0x13 => {
-                self.dma_length &= 0xFF_00;
-                self.dma_length |= value as u16;
-            }
-            0x14 => {
-                self.dma_length &= 0x00_FF;
-                self.dma_length |= (value as u16) << 8;
-            }
-            0x15 => {
-                // Low byte
-                self.dma_source &= 0xFF_FF_00;
-                self.dma_source |= value as u32 * 2;
-            }
-            0x16 => {
-                // Middle byte
-                self.dma_source &= 0xFF_00_FF;
-                self.dma_source |= (value as u32 * 2) << 8;
-            }
-            0x17 => {
-                // High byte, DMA type
-                self.dma_mode = match value >> 6 {
-                    0b00 | 0b01 => DmaMode::CpuCopy,
-                    0b10 => DmaMode::VramFill,
-                    0b11 => DmaMode::VramCopy,
-                    _ => unreachable!(),
-                };
-
-                let high_byte_mask = if self.dma_mode == DmaMode::CpuCopy {
-                    0x7F
-                } else {
-                    0x3F
-                };
-
-                self.dma_source &= 0x00_FF_FF;
-                self.dma_source |= (value as u32 & high_byte_mask) << 16;
-                println!("DMA source is now {:#X}", self.dma_target.0);
-            }
-            _ => {
-                println!(
-                    "TODO: Ignoring write of {:#X} to register {:#X}",
-                    value, index
-                );
-            }
+impl Vdp {
+    pub fn new() -> Vdp {
+        Vdp {
+            inner: VdpInner::new(),
+            bus: Bus::new(),
         }
     }
 
-    // Returns address and CD value
-    // Format for an address write is:
-    // CD1 CD0 A13 A12 A11 A10 A09 A08
-    // A07 A06 A05 A04 A03 A02 A01 A00
-    // ___ ___ ___ ___ ___ ___ ___ ___
-    // CD5 CD4 CD3 CD2 ___ ___ A15 A14
-    pub fn parse_control_write(&mut self, value: u32) -> (u16, u8) {
-        let bytes = value.to_be_bytes();
-
-        assert_eq!(bytes[2], 0, "Invalid control write: {:#X}", value);
-        assert_eq!(bytes[3] & 0b1100, 0, "Invalid control write: {:#X}", value);
-
-        let address = ((value as u16 & 0b11) << 14)
-            | ((bytes[0] as u16 & 0b111_111) << 8)
-            | (bytes[1] as u16);
-
-        let cd = ((bytes[3] >> 2) & 0b111_100) | (bytes[0] >> 6);
-
-        (address, cd)
+    pub fn read(&mut self, addr: u32) -> u16 {
+        self.bus.read(addr, &mut self.inner)
     }
 
-    fn write_data_reg(&mut self, value: u16) {
-        if self.dma_mode == DmaMode::VramFill && self.fill_pending {
-            self.fill_pending = false;
-            self.dma_fill(value);
-        } else {
-            let (address, is_write, ram_type) = self.ram_address;
-            if is_write {
-                match ram_type {
-                    RamMode::VRam => {
-                        self.vram[address as usize..][0..2].copy_from_slice(&value.to_be_bytes())
-                    }
-                    RamMode::CRam => self.cram[address as usize / 2].0 = value,
-                    RamMode::VSRam => {
-                        let address = (address & 0x4F) / 2;
-                        let value = value & 0x3FF;
-
-                        self.vsram[address as usize] = value;
-                    }
-                }
-            } else {
-                panic!("Ignoring write of {:#X} to data register", value);
-            }
-
-            self.ram_address.0 = self.ram_address.0.wrapping_add(self.auto_increment as u16);
-        }
+    pub fn write(&mut self, addr: u32, value: u32, size: Size, cpu: &mut Cpu) {
+        self.bus.write(addr, value, size, cpu, &mut self.inner);
     }
+}
 
-    pub fn command_write(&mut self, value: u32, cpu: &mut Cpu) {
-        // Separate the CD and the address bits
-        let (address, cd) = self.parse_control_write(value);
+impl Deref for Vdp {
+    type Target = VdpInner;
 
-        let (cd_type, ram_mode) = decode_cd(cd as u8);
-
-        self.dma_target = (address, ram_mode);
-
-        match cd_type {
-            CDMode::Normal(is_write) => {
-                self.ram_address = (address, is_write, ram_mode);
-                println!(
-                    "RAM address is now {:#X}, is_write: {}, mode: {:?}",
-                    self.ram_address.0, self.ram_address.1, self.ram_address.2,
-                );
-            }
-            CDMode::CpuCopy => {
-                // TODO: Why????
-                if self.dma_source >> 16 == 0x7F {
-                    self.dma_source |= 0x80_00_00
-                }
-                // TODO: This may not be correct
-                match self.dma_target {
-                    (addr, RamMode::VRam) => {
-                        println!("CPU to VRAM DMA with length {:#X}", self.dma_length);
-                        for i in 0..self.dma_length {
-                            self.vram[(addr + i) as usize] =
-                                cpu.read(self.dma_source + i as u32, Size::Byte) as u8;
-                        }
-                    }
-                    (addr, RamMode::CRam) => {
-                        println!("CPU to CRAM DMA with length {:#X}", self.dma_length);
-                        // TODO: Am I supposed to mask the DMA length like this...?
-                        for i in 0..((self.dma_length & 0xFF) / 2) {
-                            // TODO: This may be somewhat off, also CRAM and VSRAM uses word wide
-                            // reads I believe
-                            self.cram[(addr / 2 + i) as usize].0 =
-                                cpu.read(self.dma_source + i as u32 * 2, Size::Word) as u16;
-                        }
-                    }
-                    _ => todo!("CPU to VDP destination {:?}", self.dma_target),
-                }
-            }
-            CDMode::VramCopy => {
-                self.vram_copy();
-            }
-            CDMode::VramFill => {
-                self.fill_pending = true;
-            }
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
+}
 
-    fn write_word(&mut self, addr: u32, value: u16, cpu: &mut Cpu) {
-        // TODO: Emulate this properly
-        let reg = Register::decode(addr & !0x1).unwrap();
-
-        // 68k to VDP => Writing command word:
-        // CD1 CD0 _ _ _ _ _ _
-        // ...
-        // ...
-        // 1 0 0 CD2 _ _ _ _
-        //
-        // VRAM Fill => Requires source register T1 T0 == 1 0
-        // and command word:
-        // 0 1 _ _ _ _ _ _
-        // ...
-        // ...
-        // 1 0 0 0 _ _ _ _
-
-        match reg {
-            Register::Data => {
-                self.write_data_reg(value);
-                self.write_pending = None;
-            }
-            Register::StatusControl => {
-                if let Some(first_half) = self.write_pending {
-                    let value = ((first_half as u32) << 16) | value as u32;
-                    self.command_write(value, cpu);
-                    self.write_pending = None;
-                } else if bitpat!(1 0)(value >> 14) {
-                    let reg_idx = (value >> 8) & 0b11111;
-                    let reg_val = value as u8;
-                    self.set_internal_reg(reg_val, reg_idx as usize);
-                } else {
-                    self.write_pending = Some(value);
-                }
-            }
-            _ => {
-                println!("Ignoring write to {:?}", reg);
-            }
-        }
-    }
-
-    pub fn write(&mut self, addr: u32, mut value: u32, size: Size, cpu: &mut Cpu) {
-        if size == Size::Long {
-            self.write_word(addr, (value >> 16) as u16, cpu);
-            self.write_word(addr, value as u16, cpu);
-            return;
-        }
-
-        if size == Size::Byte {
-            value |= value << 8;
-        }
-
-        self.write_word(addr, value as u16, cpu)
+impl DerefMut for Vdp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
