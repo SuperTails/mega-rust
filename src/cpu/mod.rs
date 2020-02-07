@@ -1,7 +1,11 @@
+// TODO: Maybe remove this later?
+#![allow(dead_code)]
+
 pub mod instruction;
+pub mod address_space;
+use address_space::AddressSpace;
 use crate::controller::Controller;
 use crate::get_four_bytes;
-use crate::get_two_bytes;
 use crate::vdp::Vdp;
 use crate::Interrupt;
 use bitfield::bitfield;
@@ -9,7 +13,6 @@ use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
 use std::collections::BinaryHeap;
 use std::fmt;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Weak};
 
@@ -23,6 +26,29 @@ pub fn do_log(do_l: bool) {
 
 pub fn log_instr() -> bool {
     LOG_INSTR.load(Ordering::SeqCst)
+}
+
+bitfield! {
+    #[derive(Clone, Copy, PartialEq)]
+    pub struct Sr(u8);
+    impl Debug;
+
+    pub priority, set_priority: 2, 0;
+    pub master, set_master: 4;
+    pub supervisor, set_supervisor: 5;
+    pub trace, set_trace: 7, 6;
+}
+
+impl fmt::Display for Sr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.supervisor() {
+            write!(f, "SUP ")?;
+        } else {
+            write!(f, "USR ")?;
+        }
+
+        write!(f, "IPL: {:>3}", self.priority())
+    }
 }
 
 bitfield! {
@@ -65,8 +91,8 @@ impl fmt::Display for CpuCore {
         writeln!(f, "======== CPU Core State =========")?;
         writeln!(
             f,
-            "PC: {:#06X} USP: {:#06X}, CCR: {}",
-            self.pc, self.usp, self.ccr
+            "PC: {:#06X} USP: {:#06X}, SR: {}|{} ",
+            self.pc, self.usp, self.sr, self.ccr,
         )?;
         writeln!(f, "------------- Registers ---------")?;
         for (idx, (d, a)) in self.data.iter().zip(self.addr.iter()).enumerate() {
@@ -85,7 +111,7 @@ pub struct CpuCore {
     usp: u32,
     pub pc: u32,
     pub ccr: Ccr,
-    sr: u8,
+    pub sr: Sr,
 
     cycle: usize,
     state: State,
@@ -128,11 +154,217 @@ impl Cpu {
         }
     }
 
-    pub fn read(&self, addr: u32, size: Size) -> u32 {
+    pub fn instr_at(&mut self, addr: u32) -> Instruction {
+        Instruction::new(self.read(addr, Size::Word) as u16)
+    }
+
+    fn do_reset(&mut self) {
+        assert_eq!(self.core.pc % 4, 0);
+        assert!(self.core.pc < 0x100);
+
+        let offset = self.core.pc as usize;
+        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[offset..offset + 4]));
+
+        println!(
+            "Using vector at {:#08X}, PC will be {:#08X}",
+            offset, vector
+        );
+
+        // TODO: Determine actual cycle count and behavior
+        self.core.pc = vector;
+        self.core.cycle += 1;
+        self.core.state = State::Run;
+    }
+
+    fn on_external_int(&mut self) {
+        todo!("External interrupt")
+    }
+
+    fn on_horizontal_int(&mut self) {
+        // TODO: This should use the SSP instead of A7 I think
+        self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
+        self.write(self.core.addr[7], self.core.pc, Size::Long);
+        self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
+        self.write(
+            self.core.addr[7],
+            ((self.core.sr.0 as u32) << 8) | self.core.ccr.0 as u32,
+            Size::Word,
+        );
+
+        let vector =
+            u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
+
+        self.core.sr.set_priority(4);
+        self.core.sr.set_supervisor(true);
+        self.core.pc = vector;
+        println!("Did horizontal interrupt");
+    }
+
+    fn on_vertical_int(&mut self) {
+        // TODO: This should use the SSP instead of A7 I think
+        self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
+        self.write(self.core.addr[7], self.core.pc, Size::Long);
+        self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
+        self.write(
+            self.core.addr[7],
+            ((self.core.sr.0 as u32) << 8) | self.core.ccr.0 as u32,
+            Size::Word,
+        );
+
+        let vector =
+            u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
+
+        self.core.sr.set_priority(6);
+        self.core.sr.set_supervisor(true);
+        self.core.pc = vector;
+        println!("Did vertical interrupt");
+    }
+
+    fn handle_interrupts(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+        if let Some(int) = pending.peek() {
+            if *int as u8 > self.core.sr.priority() {
+                let int = pending.pop().unwrap();
+                match int {
+                    Interrupt::External => {
+                        self.on_external_int();
+                    }
+                    Interrupt::Horizontal => {
+                        self.on_horizontal_int();
+                    }
+                    Interrupt::Vertical => {
+                        self.on_vertical_int();
+                    }
+                }
+            }
+        }
+    }
+
+    fn do_run(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+        self.handle_interrupts(pending);
+
+        assert_eq!(self.core.pc % 2, 0);
+
+        let instr = self.instr_at(self.core.pc as u32);
+
+        if log_instr() {
+            println!("Instr: {:?}", instr.opcode);
+        }
+
+        let prev_sup = self.core.sr.supervisor();
+
+        // TODO: Cycle counts
+        instr.execute(self);
+
+        if prev_sup != self.core.sr.supervisor() {
+            std::mem::swap(&mut self.core.addr[7], &mut self.core.usp);
+        }
+    }
+
+    // TODO: Access Z80, VDP, expansion ports, and IO registers
+    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+        match self.core.state {
+            State::Reset => {
+                self.do_reset();
+            }
+            State::Run => {
+                self.do_run(pending);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogParseError {
+    data: String,
+}
+
+impl std::fmt::Display for LogParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for LogParseError {}
+
+impl CpuCore {
+    pub fn new() -> CpuCore {
+        CpuCore {
+            data: [0; 8],
+            addr: [0; 8],
+            usp: 0,
+            pc: 0x0004,
+            ccr: Ccr(0),
+            sr: { let mut sr = Sr(0); sr.set_supervisor(true); sr },
+            cycle: 0,
+            state: State::Reset,
+        }
+    }
+
+    pub fn read_log(log: &str) -> Result<Vec<CpuCore>, Box<dyn std::error::Error>> {
+        let line_split = log.lines().skip(2).collect::<Vec<&str>>();
+
+        let groups = line_split.chunks_exact(6);
+
+        if !groups.remainder().is_empty() {
+            return Err(Box::new(LogParseError {
+                data: format!("Excess lines: {:?}", groups.remainder()),
+            })
+            .into());
+        }
+
+        let mut result = Vec::new();
+
+        for group in groups {
+            let mut state = CpuCore::new();
+
+            let parse_one = |d: &str| {
+                u32::from_str_radix(d.trim(), 16).map_err(|_| LogParseError {
+                    data: d.to_string(),
+                })
+            };
+
+            let read_regs = |line: &str| -> Result<(u32, u32, u32, u32), LogParseError> {
+                Ok((
+                    parse_one(&line[3..12])?,
+                    parse_one(&line[15..24])?,
+                    parse_one(&line[27..36])?,
+                    parse_one(&line[39..48])?,
+                ))
+            };
+
+            for (line_num, line) in group[1..5].iter().enumerate() {
+                let read = read_regs(line)?;
+                state.data[line_num] = read.0;
+                state.data[4 + line_num] = read.1;
+                state.addr[line_num] = read.2;
+                state.addr[4 + line_num] = read.3;
+            }
+
+            let sr = u16::from_str_radix(&group[2][51..], 2)?;
+            state.sr.0 = (sr >> 8) as u8;
+            state.ccr.0 = sr as u8;
+            let us = parse_one(&group[3][51..])?;
+            state.usp = us;
+            // TODO: What is this
+            let _ss = parse_one(&group[4][51..])?;
+
+            let pc = parse_one(&group[5][3..12])?;
+            state.pc = pc;
+            state.state = State::Run;
+
+            result.push(state);
+        }
+
+        Ok(result)
+    }
+}
+
+impl AddressSpace for Cpu {
+    fn read(&mut self, address: u32, size: Size) -> u32 {
         let length = size.len();
         let align = size.alignment();
 
-        let addr = (addr & 0xFF_FF_FF) as usize;
+        let addr = (address & 0xFF_FF_FF) as usize;
 
         assert_eq!(addr & (align - 1), 0, "Misaligned read: {:#X}", addr);
 
@@ -188,11 +420,11 @@ impl Cpu {
         result
     }
 
-    pub fn write(&mut self, addr: u32, value: u32, size: Size) {
+    fn write(&mut self, address: u32, value: u32, size: Size) {
         let length = size.len();
         let align = size.alignment();
 
-        let addr = (addr & 0xFF_FF_FF) as usize;
+        let addr = (address & 0xFF_FF_FF) as usize;
 
         assert_eq!(
             addr & (align - 1),
@@ -279,213 +511,5 @@ impl Cpu {
                 println!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };
         }
-    }
-
-    pub fn instr_at(&self, addr: u32) -> Instruction {
-        Instruction::new(u16::from_be_bytes(get_two_bytes(
-            &self.rom[addr as usize..][..2],
-        )))
-    }
-
-    // TODO: Access Z80, VDP, expansion ports, and IO registers
-    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
-        match self.core.state {
-            State::Reset => {
-                assert_eq!(self.core.pc % 4, 0);
-                assert!(self.core.pc < 0x100);
-
-                let offset = self.core.pc as usize;
-                let vector = u32::from_be_bytes(get_four_bytes(&self.rom[offset..offset + 4]));
-
-                println!(
-                    "Using vector at {:#08X}, PC will be {:#08X}",
-                    offset, vector
-                );
-
-                // TODO: Determine actual cycle count and behavior
-                self.core.pc = vector;
-                self.core.cycle += 1;
-                self.core.state = State::Run;
-            }
-            State::Run => {
-                // 0x376 -> finish clearing RAM, then branch to:
-                // VDPSetupGame @ 0x1222 - 0x129C
-                // SoundDriverLoad @ 0x134A
-                //  - KosDec @ 0x1894
-                // JoypadInit
-                //
-                //
-                /*if self.core.pc == 0x462 {
-                    panic!("Hit 0x462");
-                } else if self.core.pc == 0x43A {
-                    panic!("Hit 0x43A");
-                }*/
-
-                if let Some(int) = pending.peek() {
-                    let mask_level = self.core.sr & 0x7;
-
-                    if *int as u8 > mask_level {
-                        let int = pending.pop().unwrap();
-                        match int {
-                            Interrupt::External => {
-                                unimplemented!("External interrupt");
-                            }
-                            Interrupt::Horizontal => {
-                                // TODO: This should use the SSP instead of A7 I think
-                                self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
-                                self.write(self.core.addr[7], self.core.pc, Size::Long);
-                                self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
-                                self.write(
-                                    self.core.addr[7],
-                                    ((self.core.sr as u32) << 8) | self.core.ccr.0 as u32,
-                                    Size::Word,
-                                );
-
-                                let vector =
-                                    u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
-
-                                self.core.sr = 4;
-                                self.core.pc = vector;
-                                println!("Did horizontal interrupt");
-                            }
-                            Interrupt::Vertical => {
-                                // TODO: This should use the SSP instead of A7 I think
-                                self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
-                                self.write(self.core.addr[7], self.core.pc, Size::Long);
-                                self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
-                                self.write(
-                                    self.core.addr[7],
-                                    ((self.core.sr as u32) << 8) | self.core.ccr.0 as u32,
-                                    Size::Word,
-                                );
-
-                                let vector =
-                                    u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
-
-                                self.core.sr = 6;
-                                self.core.pc = vector;
-                                println!("Did vertical interrupt");
-                            }
-                        }
-                    }
-                }
-
-                if self.core.pc >= 0x3F_FFFF {
-                    unimplemented!(
-                        "PC is {:#X}, Error at (v_errortype) is {:#X}",
-                        self.core.pc,
-                        self.read(0xFFFF_FC44, Size::Long)
-                    );
-                } else {
-                    assert_eq!(self.core.pc % 2, 0);
-                    assert!(self.core.pc <= 0x3F_FFFF);
-
-                    let offset = self.core.pc % self.rom.len() as u32;
-
-                    if log_instr() {
-                        println!(
-                            "\nPC:{:08X}, A7: {:08X} CCR: {}",
-                            self.core.pc, self.core.addr[7], self.core.ccr,
-                        );
-                        std::io::stdout().flush().unwrap();
-                    }
-
-                    let instr = self.instr_at(offset as u32);
-
-                    if log_instr() {
-                        println!("Instr: {:?}", instr.opcode);
-                    }
-
-                    // TODO: Cycle counts
-                    instr.execute(self);
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct LogParseError {
-    data: String,
-}
-
-impl std::fmt::Display for LogParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl std::error::Error for LogParseError {}
-
-impl CpuCore {
-    pub fn new() -> CpuCore {
-        CpuCore {
-            data: [0; 8],
-            addr: [0; 8],
-            usp: 0,
-            pc: 0x0004,
-            ccr: Ccr(0),
-            sr: 0,
-            cycle: 0,
-            state: State::Reset,
-        }
-    }
-
-    pub fn read_log(log: &str) -> Result<Vec<CpuCore>, Box<dyn std::error::Error>> {
-        let line_split = log.lines().skip(2).collect::<Vec<&str>>();
-
-        let groups = line_split.chunks_exact(6);
-
-        if !groups.remainder().is_empty() {
-            return Err(Box::new(LogParseError {
-                data: format!("Excess lines: {:?}", groups.remainder()),
-            })
-            .into());
-        }
-
-        let mut result = Vec::new();
-
-        for group in groups {
-            let mut state = CpuCore::new();
-
-            let parse_one = |d: &str| {
-                u32::from_str_radix(d.trim(), 16).map_err(|_| LogParseError {
-                    data: d.to_string(),
-                })
-            };
-
-            let read_regs = |line: &str| -> Result<(u32, u32, u32, u32), LogParseError> {
-                Ok((
-                    parse_one(&line[3..12])?,
-                    parse_one(&line[15..24])?,
-                    parse_one(&line[27..36])?,
-                    parse_one(&line[39..48])?,
-                ))
-            };
-
-            for (line_num, line) in group[1..5].iter().enumerate() {
-                let read = read_regs(line)?;
-                state.data[line_num] = read.0;
-                state.data[4 + line_num] = read.1;
-                state.addr[line_num] = read.2;
-                state.addr[4 + line_num] = read.3;
-            }
-
-            let sr = u16::from_str_radix(&group[2][51..], 2)?;
-            state.sr = (sr >> 8) as u8;
-            state.ccr.0 = sr as u8;
-            let us = parse_one(&group[3][51..])?;
-            state.usp = us;
-            // TODO: What is this
-            let _ss = parse_one(&group[4][51..])?;
-
-            let pc = parse_one(&group[5][3..12])?;
-            state.pc = pc;
-            state.state = State::Run;
-
-            result.push(state);
-        }
-
-        Ok(result)
     }
 }

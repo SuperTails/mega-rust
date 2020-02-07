@@ -1,5 +1,5 @@
 use crate::cpu::instruction::Size;
-use crate::cpu::Cpu;
+use crate::cpu::address_space::AddressSpace;
 use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
 use bitfield::bitfield;
@@ -43,7 +43,7 @@ impl AccessType {
                 }
             }
         } else {
-            panic!("Ignoring write of {:#X} to data register", value);
+            println!("Ignoring write of {:#X} to data register", value);
         }
 
         self.address = self.address.wrapping_add(increment);
@@ -70,6 +70,72 @@ impl AccessType {
 
         result
     }
+}
+
+#[derive(Debug)]
+struct SpriteEntry {
+    y: u16,
+    /// Width of the sprite, measured in cells
+    width: u8,
+    /// Height of the sprite, measured in cells
+    height: u8,
+    /// Index in the sprite attribute table of the next sprite, or zero if none
+    link: u8,
+    pattern_start_index: u16,
+    horizontal_flip: bool,
+    vertical_flip: bool,
+    palette_line: u8,
+    priority: bool,
+    x: u16,
+}
+
+impl From<&[u8]> for SpriteEntry {
+    fn from(data: &[u8]) -> SpriteEntry {
+        assert_eq!(data.len(), 8);
+
+        let mut d = [0; 8];
+        d.copy_from_slice(data);
+        d.into()
+    }
+}
+
+impl From<[u8; 8]> for SpriteEntry {
+    fn from(data: [u8; 8]) -> SpriteEntry {
+        let y = (((data[0] as u16) << 8) | data[1] as u16) & 0x3FF; 
+        let height = 1 + (data[2] & 0x3);
+        let width = 1 + ((data[2] >> 2) & 0x3);
+        let link = data[3] & 0x7F;
+        let pattern_start_index = (((data[4] as u16) << 8) | data[5] as u16) & 0x7FF;
+        let horizontal_flip = data[4] & (1 << 3) != 0;
+        let vertical_flip = data[4] & (1 << 4) != 0;
+        let palette_line = (data[4] >> 5) & 0x3;
+        let priority = data[4] & (1 << 7) != 0;
+        let x = (((data[6] as u16) << 8) | data[7] as u16) & 0x3FF;
+        SpriteEntry {
+            y,
+            height,
+            width,
+            link,
+            pattern_start_index,
+            horizontal_flip,
+            vertical_flip,
+            palette_line,
+            priority,
+            x,
+        }
+    }
+}
+
+fn swatch_from_pattern(pattern: &[u8], pixel_row: u16, pixel_col: u16) -> u8 {
+    assert!(pixel_col < 8);
+    assert!(pixel_row < 8);
+
+    const BYTES_PER_ROW: usize = 4;
+
+    let data_row = &pattern[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
+    let pixel_byte = data_row[pixel_col as usize / 2];
+    let shift = if pixel_col % 2 == 1 { 0 } else { 4 };
+    (pixel_byte >> shift) & 0xF
 }
 
 /// The Video Display Processor (VDP) handles all of the
@@ -351,6 +417,72 @@ impl VdpInner {
         TileEntry(entry)
     }
 
+    fn get_color(&self, swatch: u8, palette_line: u8) -> (u8, u8, u8) {
+        let color = self.cram[palette_line as usize * 0x10 + swatch as usize];
+        (
+            (color.red() as u8) << 5,
+            (color.green() as u8) << 5,
+            (color.blue() as u8) << 5,
+        )
+    }
+
+    fn render_sprites(&self, sdl_system: &mut SDLSystem) {
+        let sprite_table = &self.vram[self.sprite_table_addr as usize..][..640];
+
+        let mut sprite: SpriteEntry = sprite_table[..8].into();
+        loop {
+            let corner_x = sprite.x as i32 - 128;
+            let corner_y = sprite.y as i32 - 128;
+            let mut offset = 0;
+            for tile_x in 0..sprite.width {
+                for tile_y in 0..sprite.height {
+                    for inner_x in 0..8 {
+                        for inner_y in 0..8 {
+                            let x = tile_x * 8 + inner_x;
+                            let y = tile_y * 8 + inner_y;
+
+                            let pattern_addr = (sprite.pattern_start_index + offset) * 0x20;
+
+                            let swatch = swatch_from_pattern(&self.vram[pattern_addr as usize..], y as u16 % 8, x as u16 % 8);
+                            if swatch != 0 {
+                                let color = self.get_color(swatch, sprite.palette_line);
+                                let point = Point::new(corner_x + x as i32, corner_y + y as i32);
+
+                                sdl_system.canvas.set_draw_color(color);
+                                sdl_system.canvas.draw_point(point).unwrap();
+                            }
+                        }
+                    }
+
+                    offset += 1;
+                }
+            }
+
+            if sprite.link == 0 {
+                break;
+            }
+
+            sprite = sprite_table[sprite.link as usize * 8..][..8].into();
+        }
+    }
+
+    fn get_pattern_color(&self, tile_address: u16, pixel_row: u16, pixel_col: u16) -> Option<(u8, u8, u8)> {
+        let tile_entry = self.get_tile_entry(tile_address);
+
+        let tile_addr = tile_entry.tile_index() as usize * 0x20;
+        let palette_line = tile_entry.palette_line();
+
+        let tile_pattern = &self.vram[tile_addr..][0..0x20];
+
+        let data = swatch_from_pattern(tile_pattern, pixel_row, pixel_col);
+
+        if data == 0 {
+            None
+        } else {
+            Some(self.get_color(data, palette_line as u8))
+        }
+    }
+
     fn render_planes(&self, sdl_system: &mut SDLSystem) {
         // TODO: Maybe use this?
         let _plane_cell_height = self.plane_height / 8;
@@ -365,15 +497,6 @@ impl VdpInner {
                 let cell = cell_row * plane_cell_width + cell_col;
 
                 let get_color = |addr: u16, window: bool| -> Option<(u8, u8, u8)> {
-                    let tile_entry = self.get_tile_entry(addr);
-
-                    let tile_addr = tile_entry.tile_index() as usize * 0x20;
-                    let palette_line = tile_entry.palette_line();
-
-                    let tile = &self.vram[tile_addr..][0..0x20];
-
-                    const BYTES_PER_ROW: usize = 4;
-
                     let pixel_row = if window {
                         (row + self.window_vertical)
                     } else {
@@ -386,22 +509,17 @@ impl VdpInner {
                         col
                     } % 8;
 
-                    let data_row = &tile[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
-                    let pixel_byte = data_row[pixel_col as usize / 2];
-                    let shift = if pixel_col % 2 == 1 { 0 } else { 4 };
-                    let data = (pixel_byte >> shift) & 0xF;
-
-                    if data == 0 {
-                        None
-                    } else {
-                        let color = self.cram[palette_line as usize * 0x10 + data as usize];
-                        Some((
-                            (color.red() as u8) << 5,
-                            (color.green() as u8) << 5,
-                            (color.blue() as u8) << 5,
-                        ))
-                    }
+                    self.get_pattern_color(addr, pixel_row, pixel_col)
                 };
+
+                // Ordering, from front to back:
+                // High Priority Sprites
+                // High Priority Plane A
+                // High Priority Plane B
+                // Low Priority Sprites
+                // Low Priority Plane A
+                // Low Priority Plane B
+                // Backdrop Color
 
                 let addr_z = self.window_nametable.wrapping_add(cell * 2);
                 let addr_a = self.plane_a_nametable.wrapping_add(cell * 2);
@@ -493,6 +611,7 @@ impl VdpInner {
         self.render_planes(sdl_system);
         self.render_vram(sdl_system);
         self.render_cram(sdl_system);
+        self.render_sprites(sdl_system);
 
         sdl_system.canvas().set_scale(0.5, 0.5).unwrap();
         sdl_system.canvas().present();
@@ -530,10 +649,16 @@ impl VdpInner {
             false
         };
 
+        if self.scanline < 10 {
+            *int = int.clone().into_iter().filter(|i| i != &Interrupt::Vertical).collect();
+        }
+
         // TODO: This might not be correct
         if self.scanline == 262 {
             // One frame has finished
             self.scanline = 0;
+
+            println!("Frame finished");
 
             if self.mode2.vert_interrupt() && !int.iter().any(|i| i == &Interrupt::Vertical) {
                 int.push(Interrupt::Vertical);
@@ -572,19 +697,18 @@ impl VdpInner {
         ((jumped_scanline as u16) << 8) | jumped_pixel as u16
     }
 
+    // TODO: Add vertical interrupt pending flag, and others
     pub fn get_status(&self) -> u16 {
-        let pixel = self.get_pixel();
-
-        let vblank_bit = self.scanline > 224;
-        let hblank_bit = pixel > 256;
-        // TODO: Everything else
+        // TODO: Set the vblank bit at the proper part of the scan
+        let vblank_bit = self.scanline > 0xE0 && self.scanline < 0xFF;
+        let hblank_bit = self.get_pixel() >= 0xE4 || self.get_pixel() < 0x08;
 
         (1 << 9) | // Always show FIFO as being empty
             ((vblank_bit as u16) << 3) |
             ((hblank_bit as u16) << 2)
     }
 
-    pub fn cpu_copy(&mut self, cpu: &mut Cpu) {
+    pub fn cpu_copy(&mut self, cpu: &mut dyn AddressSpace) {
         // TODO: Why????
         if self.dma_source >> 16 == 0x7F {
             self.dma_source |= 0x80_00_00
@@ -601,7 +725,8 @@ impl VdpInner {
             (addr, RamMode::CRam) => {
                 println!("CPU to CRAM DMA with length {:#X}", self.dma_length);
                 // TODO: Am I supposed to mask the DMA length like this...?
-                for i in 0..((self.dma_length & 0xFF) / 2) {
+                //for i in 0..((self.dma_length & 0xFF) / 2) {
+                for i in 0..self.dma_length / 2 {
                     // TODO: This may be somewhat off, also CRAM and VSRAM uses word wide
                     // reads I believe
                     self.cram[(addr / 2 + i) as usize].0 =
@@ -658,7 +783,7 @@ impl Vdp {
         self.bus.read(addr, &mut self.inner)
     }
 
-    pub fn write(&mut self, addr: u32, value: u32, size: Size, cpu: &mut Cpu) {
+    pub fn write(&mut self, addr: u32, value: u32, size: Size, cpu: &mut dyn AddressSpace) {
         self.bus.write(addr, value, size, cpu, &mut self.inner);
     }
 }

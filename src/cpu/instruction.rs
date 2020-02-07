@@ -1,4 +1,4 @@
-use super::{log_instr, Ccr, Cpu};
+use super::{log_instr, Ccr, Cpu, address_space::AddressSpace};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
@@ -11,12 +11,12 @@ use std::fmt;
 mod addressing;
 mod pages;
 
-fn read_immediate(cpu: &Cpu, size: Size) -> u32 {
+fn read_immediate(cpu: &mut Cpu, size: Size) -> u32 {
     let new_size = if size == Size::Byte { Size::Word } else { size };
 
     let result = cpu.read(cpu.core.pc + 2, new_size);
-    if size == Size::Byte {
-        assert_eq!(result >> 8, 0);
+    if size == Size::Byte && result >> 8 != 0 {
+        println!("Unused top byte of immediate: {:#X}", result >> 8);
     }
     result
 }
@@ -313,7 +313,7 @@ impl Immediates {
         if self.use_ccr() {
             (cpu.core.ccr.0 as u32)
         } else if self.use_sr() {
-            (cpu.core.sr as u32) << 8 | (cpu.core.ccr.0 as u32)
+            (cpu.core.sr.0 as u32) << 8 | (cpu.core.ccr.0 as u32)
         } else {
             self.mode.read_offset(self.size.aligned_len() as u32, self.size, cpu)
         }
@@ -323,7 +323,7 @@ impl Immediates {
         if self.use_ccr() {
             cpu.core.ccr.0 = value as u8;
         } else if self.use_sr() {
-            cpu.core.sr = (value >> 8) as u8;
+            cpu.core.sr.0 = (value >> 8) as u8;
             cpu.core.ccr.0 = value as u8;
         } else {
             self.mode.write_offset(value, self.size.aligned_len() as u32, self.size, cpu)
@@ -608,12 +608,12 @@ impl Instr for Miscellaneous {
                 }
             }
             Miscellaneous::MoveFromSr(mode) => {
-                let value = (cpu.core.sr as u16) << 8 | cpu.core.ccr.0 as u16;
+                let value = (cpu.core.sr.0 as u16) << 8 | cpu.core.ccr.0 as u16;
                 mode.write_offset(value as u32, 0, Size::Word, cpu);
             }
             Miscellaneous::MoveToSr(mode) => {
                 let data = mode.read_offset(0, Size::Word, cpu);
-                cpu.core.sr = (data >> 8) as u8;
+                cpu.core.sr.0 = (data >> 8) as u8;
                 cpu.core.ccr.0 = data as u8;
             }
             Miscellaneous::MoveToCcr(mode) => {
@@ -1298,7 +1298,7 @@ impl Instr for LinearOp {
                 }
             }
             LinearOpType::Address(reg, mode) => reg.write_sized(
-                reg.read(cpu) + mode.read_offset(0, self.size, cpu),
+                reg.read(cpu).wrapping_add(mode.read_offset(0, self.size, cpu)),
                 self.size,
                 cpu,
             ),
@@ -1897,7 +1897,7 @@ impl Instr for MoveP {
     fn execute(&self, cpu: &mut Cpu) {
         let displacement = read_immediate(cpu, Size::Word);
 
-        let addr = displacement + self.addr_reg.read(cpu);
+        let addr = displacement.wrapping_add(self.addr_reg.read(cpu));
 
         if self.direction {
             // Register to memory
@@ -2015,7 +2015,7 @@ impl Instr for MulAddExgAnd {
                 } else {
                     let val1 = op1.read(cpu);
                     let val2 = op2.read_offset(0, Size::Word, cpu);
-                    let result = val1 * val2;
+                    let result = val1.wrapping_mul(val2);
                     op1.write(result, cpu);
 
                     // Multiplication can't overflow on the 68000
@@ -2058,7 +2058,7 @@ standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) {
     cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
 
     cpu.core.pc = new_pc;
-    cpu.core.sr    = (new_sr >> 8) as u8;
+    cpu.core.sr.0  = (new_sr >> 8) as u8;
     cpu.core.ccr.0 = (new_sr     ) as u8;
 
     if log_instr() { println!("Return from exception, PC will be {:#X}", cpu.core.pc) }

@@ -1,4 +1,4 @@
-use crate::cpu::{Cpu, instruction::Size};
+use crate::cpu::{instruction::Size, address_space::AddressSpace};
 use super::{VdpInner, Register, DmaMode, decode_cd, CDMode, AccessType};
 use bitpat::bitpat;
 
@@ -175,7 +175,7 @@ impl Bus {
         }
     }
 
-    fn write_control_port(&mut self, value: u16, vdp: &mut VdpInner, cpu: &mut Cpu) {
+    fn write_control_port(&mut self, value: u16, vdp: &mut VdpInner, cpu: &mut dyn AddressSpace) {
         if let Some(first_half) = self.write_pending {
             let value = ((first_half as u32) << 16) | value as u32;
             self.command_write(value, cpu, vdp);
@@ -189,7 +189,7 @@ impl Bus {
         }
     }
 
-    fn command_write(&mut self, value: u32, cpu: &mut Cpu, vdp: &mut VdpInner) {
+    fn command_write(&mut self, value: u32, cpu: &mut dyn AddressSpace, vdp: &mut VdpInner) {
         // Separate the CD and the address bits
         let ControlWrite { address, cd } = parse_control_write(value);
 
@@ -214,7 +214,7 @@ impl Bus {
         }
     }
 
-    fn write_word(&mut self, addr: u32, value: u16, cpu: &mut Cpu, vdp: &mut VdpInner) {
+    fn write_word(&mut self, addr: u32, value: u16, cpu: &mut dyn AddressSpace, vdp: &mut VdpInner) {
         // TODO: Emulate this properly
         let reg = Register::decode(addr & !0x1).unwrap();
 
@@ -239,14 +239,14 @@ impl Bus {
             Register::StatusControl => {
                 self.write_control_port(value, vdp, cpu);
             }
-            _ => {
-                todo!("Ignoring write to {:?}", reg);
+            Register::HVCounter => {
+                println!("Ignoring write of {:#X} to HV counter", value);
             }
         }
 
     }
 
-    pub fn write(&mut self, addr: u32, mut value: u32, size: Size, cpu: &mut Cpu, vdp: &mut VdpInner) {
+    pub fn write(&mut self, addr: u32, mut value: u32, size: Size, cpu: &mut dyn AddressSpace, vdp: &mut VdpInner) {
         if size == Size::Long {
             self.write_word(addr, (value >> 16) as u16, cpu, vdp);
             self.write_word(addr, value as u16, cpu, vdp);
@@ -267,6 +267,8 @@ impl Bus {
 
         match reg {
             Register::StatusControl => vdp.get_status(),
+            // TODO: The even byte should return the V counter,
+            // and the odd byte shoudl return the H counter
             Register::HVCounter => vdp.get_hv_counter(),
             Register::Data => vdp.ram_address.read(&vdp.vram[..], &vdp.cram[..], &vdp.vsram[..], vdp.auto_increment as u16),
         }

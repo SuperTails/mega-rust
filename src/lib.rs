@@ -1,14 +1,14 @@
 pub mod cart;
 mod controller;
 mod cpu;
+mod cpu_bindings;
 mod joypad;
 mod sdl_system;
 mod vdp;
 
 use cart::Cart;
 use controller::Controller;
-use cpu::instruction::*;
-use cpu::{Cpu, CpuCore};
+use cpu_bindings::MusashiCpu;
 use sdl_system::SDLSystem;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -21,54 +21,6 @@ fn get_four_bytes(data: &[u8]) -> [u8; 4] {
     let mut result = [0; 4];
     result.copy_from_slice(data);
     result
-}
-
-fn get_two_bytes(data: &[u8]) -> [u8; 2] {
-    let mut result = [0; 2];
-    result.copy_from_slice(data);
-    result
-}
-
-fn check_log(expected: &CpuCore, actual: &CpuCore) {
-    let mut wrong = false;
-
-    if expected.data != actual.data {
-        println!(
-            "Data registers differed:\nExpected: {:#X?}\nActual: {:#X?}",
-            expected.data, actual.data
-        );
-        wrong |= true;
-    }
-
-    if expected.addr != actual.addr {
-        println!(
-            "Address registers differed:\nExpected: {:#X?}\nActual: {:#X?}",
-            expected.addr, actual.addr
-        );
-        wrong |= true;
-    }
-
-    if expected.pc != actual.pc {
-        println!(
-            "PC differed, expected: {:#X?}, actual {:#X?}",
-            expected.pc, actual.pc
-        );
-        wrong |= true;
-    }
-
-    if expected.ccr != actual.ccr {
-        println!(
-            "Conditions differed, expected:\n{:?}\nActual:\n{:?}\n",
-            expected.ccr, actual.ccr
-        );
-        wrong |= true;
-    }
-
-    if wrong {
-        panic!()
-    }
-
-    assert_eq!(expected, actual);
 }
 
 /// The 68k has Interrupt Exceptions, over 3 pins: IPL0, IPL1, IPL2
@@ -90,7 +42,13 @@ pub fn run(cart: Cart, options: Options) {
     let vdp = Arc::new(Mutex::new(Vdp::new()));
     let controller1 = Arc::new(Mutex::new(Controller::default()));
     let controller2 = Arc::new(Mutex::new(Controller::default()));
-    let mut cpu = Cpu::new(
+    /*let mut cpu = Cpu::new(
+        &cart.rom_data,
+        Arc::downgrade(&vdp),
+        Arc::downgrade(&controller1),
+        Arc::downgrade(&controller2),
+    );*/
+    let mut cpu = MusashiCpu::new(
         &cart.rom_data,
         Arc::downgrade(&vdp),
         Arc::downgrade(&controller1),
@@ -98,14 +56,9 @@ pub fn run(cart: Cart, options: Options) {
     );
     let mut sdl_system = SDLSystem::new();
     let hit_breakpoint = false;
-    let mut log_pos: Option<usize> = None;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
 
     cpu::do_log(options.log_instrs);
-
-    let log =
-        CpuCore::read_log(&std::fs::read_to_string("./roms/s1disasm/s1rev01_RunLog.txt").unwrap())
-            .unwrap();
 
     'running: loop {
         if hit_breakpoint {
@@ -129,7 +82,7 @@ pub fn run(cart: Cart, options: Options) {
                             keycode: Some(sdl2::keyboard::Keycode::P),
                             ..
                         } => {
-                            println!("{}", cpu.core);
+                            //println!("{}", cpu.core);
                         }
                         _ => {}
                     }
@@ -137,16 +90,18 @@ pub fn run(cart: Cart, options: Options) {
             }
         }
 
-        if let Some(idx) = &mut log_pos {
-            if *idx < log.len() {
-                check_log(&log[*idx], &cpu.core);
-                *idx += 1;
-            }
-        }
+        controller1.lock().unwrap().update();
+        controller2.lock().unwrap().update();
 
-        let _instr = Instruction::new(cpu.read(cpu.core.pc, Size::Word) as u16);
+        /*let instr = cpu.instr_at(cpu.core.pc);
+
+        if let Pages::Stop(_) = instr.opcode {
+        } else {
+            cpu.do_cycle(&mut pending);
+        }*/
 
         cpu.do_cycle(&mut pending);
+
         if vdp.lock().unwrap().do_cycle(&mut sdl_system, &mut pending) {
             let events: Vec<_> = sdl_system.event_pump.poll_iter().collect();
             controller1.lock().unwrap().update_buttons(&events);
@@ -158,7 +113,7 @@ pub fn run(cart: Cart, options: Options) {
                         ..
                     }
                     | sdl2::event::Event::Quit { .. } => {
-                        println!("Exited with cpu core state:\n{}", cpu.core);
+                        //println!("Exited with cpu core state:\n{}", cpu.core);
                         break 'running;
                     }
                     sdl2::event::Event::KeyDown {
@@ -172,22 +127,9 @@ pub fn run(cart: Cart, options: Options) {
             }
         }
 
-        if cpu::log_instr() {
+        /*if cpu::log_instr() {
             println!("{}", cpu.core);
-        }
-
-        if cpu.core.pc == 0x182C {
-            // TODO: The add operation shouldn't set the carry/extend flag AFAIK,
-            // but it does anyway?
-            cpu.core.ccr.set_extend(true);
-            cpu.core.ccr.set_carry(true);
-        }
-
-        if cpu.core.pc == 0x17F4 || cpu.core.pc == 0x1802 {
-            // TODO: ... and now it sets negative and overflow when it shouldn't
-            cpu.core.ccr.set_overflow(false);
-            cpu.core.ccr.set_negative(false);
-        }
+        }*/
     }
 }
 

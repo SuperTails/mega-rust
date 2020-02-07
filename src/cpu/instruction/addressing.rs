@@ -1,6 +1,6 @@
 use super::Size;
 use crate::cpu::log_instr;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, address_space::AddressSpace};
 use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -69,7 +69,7 @@ impl AddrMode {
     // TODO: HOW TO FIND SCALE
     fn address_index(self, extra: u32, cpu: &mut Cpu, reg: u32) -> Address {
         let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
-        let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8;
+        let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8 as i8;
 
         if log_instr() {
             print!("Base offset of {:#X} ", offset);
@@ -97,7 +97,7 @@ impl AddrMode {
             )
         }
 
-        Address::Address(reg.wrapping_add(reg_offset).wrapping_add(offset as u32))
+        Address::Address((reg as i64 + reg_offset as i64 + offset as i64) as u32)
     }
 
     pub fn address(self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> Address {

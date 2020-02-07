@@ -52,6 +52,13 @@ macro_rules! table {
 }
 
 impl Controller {
+    pub fn update(&mut self) {
+        self.timeout += 1;
+        if self.timeout >= 1000 {
+            self.state = 0;
+        }
+    }
+
     pub fn update_buttons(&mut self, events: &[Event]) {
         let mut mappings: HashMap<Keycode, &mut bool> = vec![
             (Keycode::Down, &mut self.states.down),
@@ -119,7 +126,11 @@ impl Controller {
 
     pub fn write_reg1(&mut self, value: u8) {
         self.timeout = 0;
+        let old_th = self.th;
         self.th = (value >> 6) & 1 != 0;
+        if !old_th && self.th {
+            self.state += 1;
+        }
     }
 
     pub fn read_reg1(&mut self) -> u8 {
