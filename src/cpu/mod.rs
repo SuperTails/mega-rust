@@ -8,6 +8,7 @@ use crate::controller::Controller;
 use crate::get_four_bytes;
 use crate::vdp::Vdp;
 use crate::Interrupt;
+use crate::cpu_bindings::*;
 use bitfield::bitfield;
 use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
@@ -80,6 +81,40 @@ impl fmt::Display for Ccr {
     }
 }
 
+impl From<&MusashiCpu> for CpuCore {
+    fn from(musashi: &MusashiCpu) -> CpuCore {
+        let pc = musashi.get_reg(m68k_register_t_M68K_REG_PC);
+        let full_sr = musashi.get_reg(m68k_register_t_M68K_REG_SR);
+        let sr = Sr((full_sr >> 8) as u8);
+        let ccr = Ccr(full_sr as u8);
+        let data = {
+            let mut data = [0; 8];
+            for (idx, d) in data.iter_mut().enumerate() {
+                *d = musashi.get_reg(m68k_register_t_M68K_REG_D0 + idx as u32);
+            }
+            data
+        };
+        let addr = {
+            let mut addr = [0; 8];
+            for (idx, a) in addr.iter_mut().enumerate() {
+                *a = musashi.get_reg(m68k_register_t_M68K_REG_A0 + idx as u32);
+            }
+            addr
+        };
+
+        CpuCore {
+            sr,
+            ccr,
+            data,
+            addr,
+            pc,
+            state: State::Run,
+            usp: 0,
+            cycle: 0,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum State {
     Run,
@@ -108,12 +143,12 @@ impl fmt::Display for CpuCore {
 pub struct CpuCore {
     pub data: [u32; 8],
     pub addr: [u32; 8],
-    usp: u32,
+    pub usp: u32,
     pub pc: u32,
     pub ccr: Ccr,
     pub sr: Sr,
 
-    cycle: usize,
+    pub cycle: usize,
     state: State,
 }
 
@@ -164,6 +199,7 @@ impl Cpu {
 
         let offset = self.core.pc as usize;
         let vector = u32::from_be_bytes(get_four_bytes(&self.rom[offset..offset + 4]));
+        let sp = u32::from_be_bytes(get_four_bytes(&self.rom[0..4]));
 
         println!(
             "Using vector at {:#08X}, PC will be {:#08X}",
@@ -171,9 +207,12 @@ impl Cpu {
         );
 
         // TODO: Determine actual cycle count and behavior
+        self.core.addr[7] = sp;
         self.core.pc = vector;
         self.core.cycle += 1;
         self.core.state = State::Run;
+        self.core.sr.set_priority(7);
+        self.core.ccr.set_zero(true);
     }
 
     fn on_external_int(&mut self) {

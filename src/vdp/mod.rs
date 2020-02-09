@@ -16,7 +16,7 @@ mod bus;
 struct AccessType {
     pub address: u16,
     pub write: bool,
-    pub ram_type: RamMode,
+    pub ram_type: RamType,
 }
 
 impl AccessType {
@@ -24,18 +24,18 @@ impl AccessType {
         AccessType {
             address: 0,
             write: false,
-            ram_type: RamMode::VRam,
+            ram_type: RamType::VRam,
         }
     }
 
     pub fn write(&mut self, value: u16, vram: &mut [u8], cram: &mut [CRamEntry], vsram: &mut [u16], increment: u16) {
         if self.write {
             match self.ram_type {
-                RamMode::VRam => {
+                RamType::VRam => {
                     vram[self.address as usize..][0..2].copy_from_slice(&value.to_be_bytes())
                 }
-                RamMode::CRam => cram[self.address as usize / 2].0 = value,
-                RamMode::VSRam => {
+                RamType::CRam => cram[(self.address as usize / 2) % cram.len()].0 = value,
+                RamType::VSRam => {
                     let address = (self.address & 0x4F) / 2;
                     let value = value & 0x3FF;
 
@@ -52,12 +52,12 @@ impl AccessType {
     pub fn read(&mut self, vram: &[u8], cram: &[CRamEntry], vsram: &[u16], increment: u16) -> u16 {
         let result = if !self.write {
             match self.ram_type {
-                RamMode::VRam => {
+                RamType::VRam => {
                     ((vram[self.address as usize] as u16) << 8)
                         | vram[self.address as usize + 1] as u16
                 }
-                RamMode::CRam => cram[self.address as usize / 2].0,
-                RamMode::VSRam => {
+                RamType::CRam => cram[(self.address as usize / 2) % cram.len()].0,
+                RamType::VSRam => {
                     let address = (self.address & 0x4F) / 2;
                     vsram[address as usize] & 0x3FF
                 }
@@ -154,9 +154,11 @@ pub struct VdpInner {
     ram_address: AccessType,
     mode1: VdpMode1,
     mode2: VdpMode2,
+    mode3: VdpMode3,
+    mode4: VdpMode4,
 
     dma_length: u16,
-    dma_target: (u16, RamMode),
+    dma_target: (u16, RamType),
     dma_source: u32,
     dma_mode: DmaMode,
     fill_pending: bool,
@@ -242,6 +244,46 @@ bitfield! {
 }
 
 bitfield! {
+    struct VdpMode3(u8);
+    impl Debug;
+
+    horiz_scroll_mode, _: 1, 0;
+
+    column_size, _: 2;
+
+    external_int, _: 3;
+}
+
+bitfield! {
+    struct VdpMode4(u8);
+    impl Debug;
+
+    width_0, _: 0;
+    width_1, _: 7;
+
+    interlace_mode, _: 2, 1;
+
+    shadow_highlight, _: 3;
+
+    external_pixel_bus, _: 4;
+
+    // TODO: Determine what these fields are
+    hs, _: 5;
+    vs, _: 6;
+}
+
+impl VdpMode4 {
+    pub fn width(&self) -> u32 {
+        assert_eq!(self.width_0(), self.width_1());
+        if self.width_0() {
+            320
+        } else {
+            256
+        }
+    }
+}
+
+bitfield! {
     #[derive(Clone, Copy)]
     struct CRamEntry(u16);
     impl Debug;
@@ -254,9 +296,7 @@ bitfield! {
 }
 
 impl VdpMode2 {
-    // TODO: Use this
-    #[allow(dead_code)]
-    pub fn width(&self) -> u32 {
+    pub fn height(&self) -> u32 {
         if self.cell_mode() {
             240
         } else {
@@ -292,7 +332,7 @@ impl Register {
 #[derive(Clone, Copy, Debug, PartialEq)]
 // The boolean represents whether it's a read or write:
 // false is read, true is write
-pub enum RamMode {
+pub enum RamType {
     VRam,
     CRam,
     VSRam,
@@ -300,21 +340,11 @@ pub enum RamMode {
 
 #[derive(Debug, Clone)]
 struct VdpAddress {
-    pub ram_type: RamMode,
+    pub ram_type: RamType,
     pub address: u16,
 }
 
-#[derive(Debug)]
-pub enum CDMode {
-    Normal(bool),
-    CpuCopy,
-    VramCopy,
-    VramFill,
-}
-
-fn decode_cd(cd: u8) -> (CDMode, RamMode) {
-    assert_eq!(cd & !0b111_111, 0, "CD: {:#b}", cd);
-
+/*
     // 68k to VDP => Writing command word:
     // CD1 CD0 _ _ _ _ _ _
     // ...
@@ -333,32 +363,7 @@ fn decode_cd(cd: u8) -> (CDMode, RamMode) {
     // ...
     // ...
     // 1 1 0 0 _ _ ? ? A15 A14
-
-    if cd == 0b110_000 {
-        (CDMode::VramCopy, RamMode::VRam)
-    } else if cd == 0b100_001 {
-        (CDMode::VramFill, RamMode::VRam)
-    } else if cd >> 3 == 0b100 {
-        let ram_mode = match cd {
-            0b100_001 => RamMode::VRam,
-            0b100_011 => RamMode::CRam,
-            0b100_101 => RamMode::VSRam,
-            _ => panic!("Unknown or invalid cd: {:#b}", cd),
-        };
-
-        (CDMode::CpuCopy, ram_mode)
-    } else {
-        match cd & 0xF {
-            0b0000 => (CDMode::Normal(false), RamMode::VRam),
-            0b0001 => (CDMode::Normal(true), RamMode::VRam),
-            0b1000 => (CDMode::Normal(false), RamMode::CRam),
-            0b0011 => (CDMode::Normal(true), RamMode::CRam),
-            0b0100 => (CDMode::Normal(false), RamMode::VSRam),
-            0b0101 => (CDMode::Normal(true), RamMode::VSRam),
-            _ => panic!("Unknown cd: {:#b}", cd),
-        }
-    }
-}
+*/
 
 bitfield! {
     struct TileEntry(u16);
@@ -385,8 +390,10 @@ impl VdpInner {
             ram_address: AccessType::new(),
             mode1: VdpMode1(0),
             mode2: VdpMode2(0),
+            mode3: VdpMode3(0),
+            mode4: VdpMode4(0),
             dma_length: 0,
-            dma_target: (0, RamMode::VRam),
+            dma_target: (0, RamType::VRam),
             dma_mode: DmaMode::VramFill,
             fill_pending: false,
             plane_a_nametable: 0,
@@ -441,7 +448,7 @@ impl VdpInner {
                             let x = tile_x * 8 + inner_x;
                             let y = tile_y * 8 + inner_y;
 
-                            let pattern_addr = (sprite.pattern_start_index + offset) * 0x20;
+                            let pattern_addr = (sprite.pattern_start_index + offset).wrapping_mul(0x20);
 
                             let swatch = swatch_from_pattern(&self.vram[pattern_addr as usize..], y as u16 % 8, x as u16 % 8);
                             if swatch != 0 {
@@ -488,26 +495,36 @@ impl VdpInner {
         let _plane_cell_height = self.plane_height / 8;
         let plane_cell_width = self.plane_width / 8;
 
-        sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
-        for row in 0..self.plane_height {
-            for col in 0..self.plane_width {
+        //sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
+        for row in 0..self.mode2.height() as u16 {
+            for col in 0..self.mode4.width() as u16 {
                 let cell_row = row / 8;
                 let cell_col = col / 8;
 
                 let cell = cell_row * plane_cell_width + cell_col;
 
                 let get_color = |addr: u16, window: bool| -> Option<(u8, u8, u8)> {
-                    let pixel_row = if window {
+                    let mut pixel_row = if window {
                         (row + self.window_vertical)
                     } else {
                         row
                     } % 8;
 
-                    let pixel_col = if window {
+                    let mut pixel_col = if window {
                         (col + self.window_horizontal)
                     } else {
                         col
                     } % 8;
+
+                    let tile = self.get_tile_entry(addr);
+
+                    if tile.horiz_flip() {
+                        pixel_col = 7 - pixel_col;
+                    }
+
+                    if tile.vert_flip() {
+                        pixel_row = 7 - pixel_row;
+                    }
 
                     self.get_pattern_color(addr, pixel_row, pixel_col)
                 };
@@ -565,7 +582,7 @@ impl VdpInner {
                     .set_draw_color(Color::RGB(entry, entry, entry));
                 sdl_system
                     .canvas()
-                    .draw_point(Point::new(c as i32 + 256, r as i32))
+                    .draw_point(Point::new(c as i32 + 8 + self.mode4.width() as i32, r as i32))
                     .unwrap();
             }
         }
@@ -583,7 +600,7 @@ impl VdpInner {
             sdl_system.canvas().set_draw_color(color);
             sdl_system
                 .canvas()
-                .draw_point(Point::new(c as i32 + 256, r as i32))
+                .draw_point(Point::new(c as i32 + 256 + 128, r as i32))
                 .unwrap();
         }
     }
@@ -599,7 +616,7 @@ impl VdpInner {
                 .set_draw_color(Color::RGB(red, green, blue));
             sdl_system
                 .canvas()
-                .draw_point(Point::new((p % 16) as i32 + 512, p as i32 / 16))
+                .draw_point(Point::new((p % 16) as i32 + 256 + 16 + self.mode4.width() as i32, p as i32 / 16))
                 .unwrap();
         }
     }
@@ -608,12 +625,12 @@ impl VdpInner {
         sdl_system.canvas().set_draw_color(Color::RGB(50, 50, 50));
         sdl_system.canvas().clear();
 
+        sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
         self.render_planes(sdl_system);
         self.render_vram(sdl_system);
         self.render_cram(sdl_system);
-        self.render_sprites(sdl_system);
-
-        sdl_system.canvas().set_scale(0.5, 0.5).unwrap();
+        //self.render_sprites(sdl_system);
+        sdl_system.canvas().set_scale(1.0, 1.0).unwrap();
         sdl_system.canvas().present();
     }
 
@@ -709,23 +726,17 @@ impl VdpInner {
     }
 
     pub fn cpu_copy(&mut self, cpu: &mut dyn AddressSpace) {
-        // TODO: Why????
-        if self.dma_source >> 16 == 0x7F {
-            self.dma_source |= 0x80_00_00
-        }
         // TODO: This may not be correct
         match self.dma_target {
-            (addr, RamMode::VRam) => {
+            (addr, RamType::VRam) => {
                 println!("CPU to VRAM DMA with length {:#X}", self.dma_length);
                 for i in 0..self.dma_length {
                     self.vram[(addr + i) as usize] =
                         cpu.read(self.dma_source + i as u32, Size::Byte) as u8;
                 }
             }
-            (addr, RamMode::CRam) => {
+            (addr, RamType::CRam) => {
                 println!("CPU to CRAM DMA with length {:#X}", self.dma_length);
-                // TODO: Am I supposed to mask the DMA length like this...?
-                //for i in 0..((self.dma_length & 0xFF) / 2) {
                 for i in 0..self.dma_length / 2 {
                     // TODO: This may be somewhat off, also CRAM and VSRAM uses word wide
                     // reads I believe
@@ -739,7 +750,7 @@ impl VdpInner {
 
     pub fn dma_fill(&mut self, fill_value: u16) {
         match self.dma_target.1 {
-            RamMode::VRam => {
+            RamType::VRam => {
                 println!("DMA Fill with target {:#X} and length {:#X} of value {:#X} and auto increment {:#X}",
                          self.dma_target.0,
                          self.dma_length,

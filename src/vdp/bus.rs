@@ -1,10 +1,58 @@
 use crate::cpu::{instruction::Size, address_space::AddressSpace};
-use super::{VdpInner, Register, DmaMode, decode_cd, CDMode, AccessType};
+use super::{VdpInner, Register, DmaMode, AccessType, RamType};
 use bitpat::bitpat;
+
+// Types:
+// Set Normal Address
+// Set 68k Copy Address
+// Set Special Address
+
+#[derive(Debug)]
+pub enum Cd {
+    Normal{ ram_type: RamType, write: bool },
+    CpuToVdp{ ram_type: RamType },
+    Special,
+}
+
+impl Cd {
+    pub fn from_raw(raw: u8) -> Cd {
+        assert_eq!(raw >> 6, 0);
+
+        let is_dma = raw & (1 << 5) != 0;
+        let is_special = raw & (1 << 4) != 0; 
+
+        if is_special {
+            assert!(is_dma);
+            assert_eq!(raw & 0xF, 0);
+            Cd::Special
+        } else {
+            let write = raw & 1 != 0;
+            let type_bits = (raw >> 1) & 0x7;
+            let ram_type = match (type_bits, write) {
+                (0b000, false) |
+                (0b000, true) |
+                // TODO: Wtf is this one
+                (0b110, false) => RamType::VRam,
+                (0b100, false) |
+                (0b001, true)  => RamType::CRam,
+                (0b010, false) |
+                (0b010, true) => RamType::VSRam,
+                _ => panic!("Invalid RAM type in CD bits: {:#b}", type_bits),
+            };
+
+            if is_dma {
+                assert!(write);
+                Cd::CpuToVdp{ ram_type }
+            } else {
+                Cd::Normal{ ram_type, write }
+            }
+        }
+    }
+}
 
 struct ControlWrite {
     pub address: u16,
-    pub cd: u8,
+    pub cd: Cd,
 }
 
 // Returns address and CD value
@@ -20,11 +68,7 @@ fn parse_control_write(value: u32) -> ControlWrite {
         | ((bytes[0] as u16 & 0b111_111) << 8)
         | (bytes[1] as u16);
 
-    let cd = ((bytes[3] >> 2) & 0b111_100) | (bytes[0] >> 6);
-
-    // I *believe* that the VDP simply ignores these bits
-    //assert_eq!(bytes[2], 0, "Invalid control write: {:#X}, addr: {:#X}, CD: {:#X}", value, address, cd);
-    //assert_eq!(bytes[3] & 0b1100, 0, "Invalid control write: {:#X}, addr: {:#X}, CD: {:#X}", value, address, cd);
+    let cd = Cd::from_raw(((bytes[3] >> 2) & 0b0011_1100) | (bytes[0] >> 6));
 
     ControlWrite {
         address,
@@ -73,8 +117,8 @@ impl Bus {
                 }
             }
             0x0A => vdp.horiz_int_period = value,
-            0x0B => println!("Ignoring write of {:#X} to VDP mode register 3", value),
-            0x0C => println!("Ignoring write of {:#X} to VDP mode register 4", value),
+            0x0B => vdp.mode3.0 = value,
+            0x0C => vdp.mode4.0 = value,
             0x0D => vdp.horiz_scroll_addr = value as u16 * 0x400,
             0x0E => assert_eq!(value, 0, "Nonzero bit 16"),
             0x0F => {
@@ -115,24 +159,33 @@ impl Bus {
                 vdp.window_vertical = offset;
             }
             0x13 => {
+                vdp.dma_length >>= 1;
                 vdp.dma_length &= 0xFF_00;
                 vdp.dma_length |= value as u16;
+                vdp.dma_length <<= 1;
             }
             0x14 => {
+                vdp.dma_length >>= 1;
                 vdp.dma_length &= 0x00_FF;
                 vdp.dma_length |= (value as u16) << 8;
+                vdp.dma_length <<= 1;
             }
             0x15 => {
+                vdp.dma_source >>= 1;
                 // Low byte
                 vdp.dma_source &= 0xFF_FF_00;
-                vdp.dma_source |= value as u32 * 2;
+                vdp.dma_source |= value as u32;
+                vdp.dma_source <<= 1;
             }
             0x16 => {
+                vdp.dma_source >>= 1;
                 // Middle byte
                 vdp.dma_source &= 0xFF_00_FF;
-                vdp.dma_source |= (value as u32 * 2) << 8;
+                vdp.dma_source |= (value as u32) << 8;
+                vdp.dma_source <<= 1;
             }
             0x17 => {
+                vdp.dma_source >>= 1;
                 // High byte, DMA type
                 vdp.dma_mode = match value >> 6 {
                     0b00 | 0b01 => DmaMode::CpuCopy,
@@ -150,10 +203,12 @@ impl Bus {
                 vdp.dma_source &= 0x00_FF_FF;
                 vdp.dma_source |= (value as u32 & high_byte_mask) << 16;
                 println!("DMA source is now {:#X}", vdp.dma_target.0);
+
+                vdp.dma_source <<= 1;
             }
             _ => {
-                todo!(
-                    "TODO: Ignoring write of {:#X} to register {:#X}",
+                panic!(
+                    "Write of {:#X} to invalid register {:#X}",
                     value, index
                 );
             }
@@ -161,7 +216,7 @@ impl Bus {
     }
 
     fn write_data_port(&mut self, value: u16, vdp: &mut VdpInner) {
-        if vdp.dma_mode == DmaMode::VramFill && vdp.fill_pending {
+        if vdp.fill_pending {
             vdp.fill_pending = false;
             vdp.dma_fill(value);
         } else {
@@ -193,23 +248,33 @@ impl Bus {
         // Separate the CD and the address bits
         let ControlWrite { address, cd } = parse_control_write(value);
 
-        let (cd_type, ram_type) = decode_cd(cd as u8);
+        println!("{:#010X}, Control write was {:#X}, {:?}", value, address, cd);
 
-        vdp.dma_target = (address, ram_type);
+        vdp.fill_pending = false;
 
-        match cd_type {
-            CDMode::Normal(write) => {
+        match cd {
+            Cd::Normal{ ram_type, write } => {
                 vdp.ram_address = AccessType{ address, write, ram_type };
                 println!("RAM address is now {:#X?}", vdp.ram_address);
             }
-            CDMode::CpuCopy => {
+            Cd::CpuToVdp{ ram_type } => {
+                vdp.dma_target = (address, ram_type);
                 vdp.cpu_copy(cpu);
             }
-            CDMode::VramCopy => {
-                vdp.vram_copy();
-            }
-            CDMode::VramFill => {
-                vdp.fill_pending = true;
+            Cd::Special => {
+                vdp.dma_target = (address, RamType::VRam);
+
+                match vdp.dma_mode {
+                    DmaMode::CpuCopy => {
+                        vdp.cpu_copy(cpu);
+                    }
+                    DmaMode::VramCopy => {
+                        vdp.vram_copy();
+                    }
+                    DmaMode::VramFill => {
+                        vdp.fill_pending = true;
+                    }
+                }
             }
         }
     }

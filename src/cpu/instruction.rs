@@ -1297,11 +1297,16 @@ impl Instr for LinearOp {
                     reg.write(result, cpu)
                 }
             }
-            LinearOpType::Address(reg, mode) => reg.write_sized(
-                reg.read(cpu).wrapping_add(mode.read_offset(0, self.size, cpu)),
-                self.size,
-                cpu,
-            ),
+            LinearOpType::Address(reg, mode) => {
+                let rhs = mode.read_offset(0, self.size, cpu);
+                let lhs = reg.read(cpu);
+                let result = if self.is_add {
+                    lhs.wrapping_add(rhs)
+                } else {
+                    lhs.wrapping_sub(rhs)
+                };
+                reg.write_sized(result, self.size, cpu);
+            }
             LinearOpType::WithExtend(kind) => {
                 let (dst, src) = match kind {
                     Either::Left((to, from)) => (
@@ -1470,6 +1475,7 @@ impl TryFrom<u16> for CompareEor {
         }
 
         if (data >> 6) & 0b11 == 0b11 {
+            // CMPA
             let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let size = Size::single_bit((data >> 8) & 1 != 0);
@@ -1477,7 +1483,7 @@ impl TryFrom<u16> for CompareEor {
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
         } else if bitpat!(1 _ _ 0 0 1)(data >> 3) {
-            // TODO: These may be flipped
+            // CMPM
             let dest_reg = AddrReg::new((data >> 9) as u8 & 0x7);
             let source_reg = AddrReg::new(data as u8 & 0x7);
             let mode = CompareMode::Memory(dest_reg, source_reg);
@@ -1485,6 +1491,7 @@ impl TryFrom<u16> for CompareEor {
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
         } else if (data >> 8) & 1 == 0 {
+            // CMP
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let size = Size::normal((data >> 6) as u8 & 3)?;
@@ -1492,6 +1499,7 @@ impl TryFrom<u16> for CompareEor {
             let data = Either::Left(mode);
             Ok(CompareEor { size, data })
         } else {
+            // EOR
             let size = Size::normal((data >> 6) as u8 & 3)?;
             let source_mode = AddrMode::new(data as u8 & 0x3F);
             let dest_reg = DataReg::new((data >> 9) as u8 & 0x7);

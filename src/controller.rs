@@ -47,7 +47,7 @@ macro_rules! table {
         { (($s.th as u8) << $shift) | table!(@buttons $s ($shift - 1), $($bt,)*) }
     };
     (@buttons $s:ident $shift:expr, $b:tt, $($bt:tt,)*) => {
-        { (($s.states.$b as u8) << $shift) | table!(@buttons $s ($shift - 1), $($bt,)*) }
+        { ((!$s.states.$b as u8) << $shift) | table!(@buttons $s ($shift - 1), $($bt,)*) }
     };
 }
 
@@ -126,11 +126,12 @@ impl Controller {
 
     pub fn write_reg1(&mut self, value: u8) {
         self.timeout = 0;
-        let old_th = self.th;
+        //let old_th = self.th;
         self.th = (value >> 6) & 1 != 0;
-        if !old_th && self.th {
+        /*if !old_th && self.th {
             self.state += 1;
-        }
+            self.state %= 4;
+        }*/
     }
 
     pub fn read_reg1(&mut self) -> u8 {
@@ -149,6 +150,8 @@ impl Controller {
 
     pub fn write_reg2(&self, value: u8) {
         // TODO:
-        println!("Ignoring write to controller RW register of {:#X}", value);
+        if value != 0x40 {
+            println!("Ignoring write to controller RW register of {:#X}", value);
+        }
     }
 }

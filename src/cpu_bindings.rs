@@ -281,10 +281,14 @@ impl MusashiCpu {
             unsafe { m68k_set_irq(0); }
         }
 
-        unsafe { m68k_execute(5); };
+        unsafe { m68k_execute(1); };
 
         if let Some(int) = pending.peek() {
             unsafe { m68k_set_irq(*int as u32); }
         }
+    }
+
+    pub fn get_reg(&self, reg: m68k_register_t) -> u32 {
+        unsafe { m68k_get_reg(std::ptr::null_mut(), reg) }
     }
 }
