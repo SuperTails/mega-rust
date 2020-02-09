@@ -1,14 +1,14 @@
-use crate::cpu::instruction::Size;
 use crate::cpu::address_space::AddressSpace;
+use crate::cpu::instruction::Size;
 use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
 use bitfield::bitfield;
+use bus::Bus;
 use sdl2::pixels::Color;
 use sdl2::rect::Point;
 use std::collections::BinaryHeap;
-use bus::Bus;
-use std::ops::{Deref, DerefMut};
 use std::convert::TryFrom;
+use std::ops::{Deref, DerefMut};
 
 mod bus;
 
@@ -28,7 +28,14 @@ impl AccessType {
         }
     }
 
-    pub fn write(&mut self, value: u16, vram: &mut [u8], cram: &mut [CRamEntry], vsram: &mut [u16], increment: u16) {
+    pub fn write(
+        &mut self,
+        value: u16,
+        vram: &mut [u8],
+        cram: &mut [CRamEntry],
+        vsram: &mut [u16],
+        increment: u16,
+    ) {
         if self.write {
             match self.ram_type {
                 RamType::VRam => {
@@ -92,7 +99,7 @@ struct SpriteEntry {
 impl From<&[u8]> for SpriteEntry {
     fn from(data: &[u8]) -> SpriteEntry {
         assert_eq!(data.len(), 8);
-        
+
         let mut d = [0; 8];
         d.copy_from_slice(data);
         SpriteEntry::from_array(d)
@@ -101,7 +108,7 @@ impl From<&[u8]> for SpriteEntry {
 
 impl SpriteEntry {
     fn from_array(data: [u8; 8]) -> SpriteEntry {
-        let y = (((data[0] as u16) << 8) | data[1] as u16) & 0x3FF; 
+        let y = (((data[0] as u16) << 8) | data[1] as u16) & 0x3FF;
         let height = 1 + (data[2] & 0x3);
         let width = 1 + ((data[2] >> 2) & 0x3);
         let link = data[3] & 0x7F;
@@ -190,9 +197,6 @@ pub struct VdpInner {
     auto_increment: u8,
 
     cycle: u64,
-    // TODO: Use this
-    #[allow(dead_code)]
-    pixel: u32,
     scanline: u32,
 
     /// The array representing the VDP's 64KiB of VRAM.
@@ -345,24 +349,24 @@ struct VdpAddress {
 }
 
 /*
-    // 68k to VDP => Writing command word:
-    // CD1 CD0 _ _ _ _ _ _
-    // ...
-    // ...
-    // 1 0 0 CD2 _ _ _ _
-    //
-    // VRAM Fill => Requires source register T1 T0 == 1 0
-    // and command word:
-    // 0 1 _ _ _ _ _ _
-    // ...
-    // ...
-    // 1 0 0 0 _ _ _ _
-    //
-    // VRAM Copy => Writing command word:
-    // 0 0 _ _ _ _ _ _
-    // ...
-    // ...
-    // 1 1 0 0 _ _ ? ? A15 A14
+// 68k to VDP => Writing command word:
+// CD1 CD0 _ _ _ _ _ _
+// ...
+// ...
+// 1 0 0 CD2 _ _ _ _
+//
+// VRAM Fill => Requires source register T1 T0 == 1 0
+// and command word:
+// 0 1 _ _ _ _ _ _
+// ...
+// ...
+// 1 0 0 0 _ _ _ _
+//
+// VRAM Copy => Writing command word:
+// 0 0 _ _ _ _ _ _
+// ...
+// ...
+// 1 1 0 0 _ _ ? ? A15 A14
 */
 
 enum HorizScrollMode {
@@ -386,39 +390,9 @@ bitfield! {
 }
 
 impl VdpInner {
-    fn get_horiz_scroll_cached(&self, (mode, data): &(HorizScrollMode, Vec<(u16, u16)>), foreground: bool, row: usize) -> u16 {
-        let pair = match mode {
-            HorizScrollMode::WholeScreen => {
-                data[0]
-            }
-            HorizScrollMode::Strips => {
-                data[row / 8]
-            }
-            HorizScrollMode::Individual => {
-                data[row]
-            }
-        };
-
-        if foreground {
-            pair.0
-        } else {
-            pair.1
-        }
-    }
-
-    fn get_horiz_scroll(&self, foreground: bool, row: usize) -> u16 {
-        let (mode, data) = self.horiz_scroll_data();
-
-        self.get_horiz_scroll_cached(&(mode, data), foreground, row)
-    }
-
     fn get_vert_scroll(&self, foreground: bool, col: usize) -> u16 {
         let (mode, data) = self.vert_scroll_data();
-        let pair = if mode {
-            data[col / 16]
-        } else {
-            data[0]
-        };
+        let pair = if mode { data[col / 16] } else { data[0] };
 
         if foreground {
             pair.0
@@ -451,7 +425,6 @@ impl VdpInner {
             plane_width: 0,
             plane_height: 0,
             bg_color: 0,
-            pixel: 0,
             scanline: 0,
             horiz_int_period: 0,
             horiz_int_counter: 0,
@@ -492,37 +465,20 @@ impl VdpInner {
         (self.mode3.vert_scroll_mode(), result)
     }
 
-    fn horiz_scroll_data(&self) -> (HorizScrollMode, Vec<(u16, u16)>) {
-        let result = match self.horiz_scroll_mode() {
-            HorizScrollMode::WholeScreen => {
-                let data = &self.vram[self.horiz_scroll_addr as usize..][..4];
-                let fg = ((data[0] as u16) << 8) | data[1] as u16;
-                let bg = ((data[2] as u16) << 8) | data[3] as u16;
-                vec![(fg, bg)]
-            }
-            HorizScrollMode::Strips => {
-                let mut result = Vec::new();
-                for idx in 0..(self.mode2.height() as usize / 8) {
-                    let data = &self.vram[self.horiz_scroll_addr as usize + idx * 32..][..4];
-                    let fg = ((data[0] as u16) << 8) | data[1] as u16;
-                    let bg = ((data[2] as u16) << 8) | data[3] as u16;
-                    result.push((fg, bg));
-                }
-                result
-            }
-            HorizScrollMode::Individual => {
-                let mut result = Vec::new();
-                for idx in 0..self.mode2.height() as usize {
-                    let data = &self.vram[self.horiz_scroll_addr as usize + idx * 4..][..4];
-                    let fg = ((data[0] as u16) << 8) | data[1] as u16;
-                    let bg = ((data[2] as u16) << 8) | data[3] as u16;
-                    result.push((fg, bg));
-                }
-                result
-            }
+    fn get_horiz_scroll(&self, row: usize, foreground: bool) -> u16 {
+        let word_idx = match self.horiz_scroll_mode() {
+            HorizScrollMode::WholeScreen => 0,
+            HorizScrollMode::Strips => row & !0xF,
+            HorizScrollMode::Individual => row,
         };
-        
-        (self.horiz_scroll_mode(), result)
+
+        let pair = &self.vram[self.horiz_scroll_addr as usize + word_idx * 4..][..4];
+
+        if foreground {
+            ((pair[0] as u16) << 8) | pair[1] as u16
+        } else {
+            ((pair[2] as u16) << 8) | pair[3] as u16
+        }
     }
 
     fn get_tile_entry(&self, addr: u16) -> TileEntry {
@@ -556,18 +512,23 @@ impl VdpInner {
                         for inner_y in 0..8 {
                             let x = tile_x * 8 + inner_x;
                             let y = tile_y * 8 + inner_y;
-                            
+
                             let pixel_y = y as u16 % 8;
                             let pixel_x = x as u16 % 8;
 
-                            let pattern_addr = (sprite.pattern_start_index + offset).wrapping_mul(0x20);
+                            let pattern_addr =
+                                (sprite.pattern_start_index + offset).wrapping_mul(0x20);
 
-                            let swatch = swatch_from_pattern(&self.vram[pattern_addr as usize..], pixel_y, pixel_x);
+                            let swatch = swatch_from_pattern(
+                                &self.vram[pattern_addr as usize..],
+                                pixel_y,
+                                pixel_x,
+                            );
                             if swatch != 0 {
                                 let color = self.get_color(swatch, sprite.palette_line);
                                 let dest_x = if sprite.horizontal_flip {
                                     sprite.width * 8 - 1 - x
-                                } else { 
+                                } else {
                                     x
                                 };
                                 let dest_y = if sprite.vertical_flip {
@@ -576,7 +537,8 @@ impl VdpInner {
                                     y
                                 };
 
-                                let point = Point::new(corner_x + dest_x as i32, corner_y + dest_y as i32);
+                                let point =
+                                    Point::new(corner_x + dest_x as i32, corner_y + dest_y as i32);
 
                                 sdl_system.canvas.set_draw_color(color);
                                 sdl_system.canvas.draw_point(point).unwrap();
@@ -603,7 +565,12 @@ impl VdpInner {
         }
     }
 
-    fn get_pattern_color(&self, tile_address: u16, pixel_row: u16, pixel_col: u16) -> Option<(u8, u8, u8)> {
+    fn get_pattern_color(
+        &self,
+        tile_address: u16,
+        pixel_row: u16,
+        pixel_col: u16,
+    ) -> Option<(u8, u8, u8)> {
         let tile_entry = self.get_tile_entry(tile_address);
 
         let tile_addr = tile_entry.tile_index() as usize * 0x20;
@@ -620,97 +587,98 @@ impl VdpInner {
         }
     }
 
-    fn render_planes(&self, sdl_system: &mut SDLSystem) {
-        // TODO: Maybe use this?
+    fn render_plane_pixel(&self, sdl_system: &mut SDLSystem, r: u16, c: u16) {
         let plane_cell_width = self.plane_width / 8;
 
-        let h = self.horiz_scroll_data();
+        let get_color = |plane: u32| -> Option<(u8, u8, u8)> {
+            let table_addr = match plane {
+                0 => self.window_nametable,
+                1 => self.plane_b_nametable,
+                2 => self.plane_a_nametable,
+                _ => panic!(),
+            };
 
+            let vert_scroll = match plane {
+                0 => self.window_vertical,
+                1 => self.get_vert_scroll(false, r as usize),
+                2 => self.get_vert_scroll(true, r as usize),
+                _ => panic!(),
+            };
+
+            let horiz_scroll = match plane {
+                0 => self.window_horizontal,
+                1 => self.get_horiz_scroll(r as usize, false),
+                2 => self.get_horiz_scroll(r as usize, true),
+                _ => panic!(),
+            };
+
+            let row = r.wrapping_add(vert_scroll) % self.plane_height;
+            let col = c.wrapping_sub(horiz_scroll) % self.plane_width;
+
+            let cell_row = row / 8;
+            let cell_col = col / 8;
+
+            let cell = cell_row * plane_cell_width + cell_col;
+
+            let mut pixel_row = row % 8;
+            let mut pixel_col = col % 8;
+
+            let addr = table_addr.wrapping_add(cell * 2);
+
+            let tile = self.get_tile_entry(addr);
+
+            if tile.horiz_flip() {
+                pixel_col = 7 - pixel_col;
+            }
+
+            if tile.vert_flip() {
+                pixel_row = 7 - pixel_row;
+            }
+
+            self.get_pattern_color(addr, pixel_row, pixel_col)
+        };
+
+        // Ordering, from front to back:
+        // High Priority Sprites
+        // High Priority Plane A
+        // High Priority Plane B
+        // Low Priority Sprites
+        // Low Priority Plane A
+        // Low Priority Plane B
+        // Backdrop Color
+
+        let color_z = get_color(0);
+        let color_b = get_color(1);
+        let color_a = get_color(2);
+
+        let overall_color = if let Some(c) = color_a {
+            c
+        } else if let Some(c) = color_b {
+            c
+        } else if let Some(c) = color_z {
+            c
+        } else {
+            let bg_color = self.cram[self.bg_color as usize];
+            (
+                (bg_color.red() as u8) << 5,
+                (bg_color.green() as u8) << 5,
+                (bg_color.blue() as u8) << 5,
+            )
+        };
+
+        sdl_system
+            .canvas()
+            .set_draw_color(Color::from(overall_color));
+        sdl_system
+            .canvas()
+            .draw_point(Point::new(c as i32, r as i32))
+            .unwrap();
+    }
+
+    fn render_planes(&self, sdl_system: &mut SDLSystem) {
         for r in 0..self.mode2.height() as u16 {
             for c in 0..self.mode4.width() as u16 {
-                let get_color = |plane: u32| -> Option<(u8, u8, u8)> {
-                    let table_addr = match plane {
-                        0 => self.window_nametable,
-                        1 => self.plane_b_nametable,
-                        2 => self.plane_a_nametable,
-                        _ => panic!(),
-                    };
-
-                    let vert_scroll = match plane {
-                        0 => self.window_vertical,
-                        1 => self.get_vert_scroll(false, r as usize),
-                        2 => self.get_vert_scroll(true, r as usize),
-                        _ => panic!(),
-                    };
-
-                    let horiz_scroll = match plane {
-                        0 => self.window_horizontal,
-                        1 => self.get_horiz_scroll_cached(&h, false, r as usize),
-                        2 => self.get_horiz_scroll_cached(&h, true, r as usize),
-                        _ => panic!(),
-                    };
-
-                    let row = r.wrapping_add(vert_scroll) % self.plane_height;
-                    let col = c.wrapping_sub(horiz_scroll) % self.plane_width;
-
-                    let cell_row = row / 8;
-                    let cell_col = col / 8;
-
-                    let cell = cell_row * plane_cell_width + cell_col;
-
-                    let mut pixel_row = row % 8;
-                    let mut pixel_col = col % 8;
-
-                    let addr = table_addr.wrapping_add(cell * 2);
-
-                    let tile = self.get_tile_entry(addr);
-
-                    if tile.horiz_flip() {
-                        pixel_col = 7 - pixel_col;
-                    }
-
-                    if tile.vert_flip() {
-                        pixel_row = 7 - pixel_row;
-                    }
-
-                    self.get_pattern_color(addr, pixel_row, pixel_col)
-                };
-
-                // Ordering, from front to back:
-                // High Priority Sprites
-                // High Priority Plane A
-                // High Priority Plane B
-                // Low Priority Sprites
-                // Low Priority Plane A
-                // Low Priority Plane B
-                // Backdrop Color
-
-                let color_z = get_color(0);
-                let color_b = get_color(1);
-                let color_a = get_color(2);
-
-                let overall_color = if let Some(c) = color_a {
-                    c
-                } else if let Some(c) = color_b {
-                    c
-                } else if let Some(c) = color_z {
-                    c
-                } else {
-                    let bg_color = self.cram[self.bg_color as usize];
-                    (
-                        (bg_color.red() as u8) << 5,
-                        (bg_color.green() as u8) << 5,
-                        (bg_color.blue() as u8) << 5,
-                    )
-                };
-
-                sdl_system
-                    .canvas()
-                    .set_draw_color(Color::from(overall_color));
-                sdl_system
-                    .canvas()
-                    .draw_point(Point::new(c as i32, r as i32))
-                    .unwrap();
+                self.render_plane_pixel(sdl_system, r, c);
             }
         }
     }
@@ -725,7 +693,10 @@ impl VdpInner {
                     .set_draw_color(Color::RGB(entry, entry, entry));
                 sdl_system
                     .canvas()
-                    .draw_point(Point::new(c as i32 + 8 + self.mode4.width() as i32, r as i32))
+                    .draw_point(Point::new(
+                        c as i32 + 8 + self.mode4.width() as i32,
+                        r as i32,
+                    ))
                     .unwrap();
             }
         }
@@ -759,21 +730,19 @@ impl VdpInner {
                 .set_draw_color(Color::RGB(red, green, blue));
             sdl_system
                 .canvas()
-                .draw_point(Point::new((p % 16) as i32 + 256 + 16 + self.mode4.width() as i32, p as i32 / 16))
+                .draw_point(Point::new(
+                    (p % 16) as i32 + 256 + 16 + self.mode4.width() as i32,
+                    p as i32 / 16,
+                ))
                 .unwrap();
         }
     }
 
     fn render(&self, sdl_system: &mut SDLSystem) {
-        sdl_system.canvas().set_draw_color(Color::RGB(50, 50, 50));
-        sdl_system.canvas().clear();
-
-        sdl_system.canvas().set_scale(2.0, 2.0).unwrap();
         self.render_planes(sdl_system);
         self.render_vram(sdl_system);
         self.render_cram(sdl_system);
         self.render_sprites(sdl_system);
-        sdl_system.canvas().set_scale(1.0, 1.0).unwrap();
         sdl_system.canvas().present();
     }
 
@@ -783,14 +752,14 @@ impl VdpInner {
         &mut self,
         sdl_system: &mut SDLSystem,
         int: &mut BinaryHeap<Interrupt>,
-    ) -> bool {
+    ) -> (bool, bool) {
         self.cycle += 1;
 
         // TODO: It should be 488.5 I think,
         // and the CPU definitely does *not* take only one cycle to execute each instruction
         //
         // TODO: But it only has a 342 pixel range!
-        let result = if self.cycle % 488 == 0 {
+        let result_1 = if self.cycle % 488 == 0 {
             // One scanline has finished
             self.scanline += 1;
             if self.horiz_int_counter == 0 {
@@ -810,11 +779,37 @@ impl VdpInner {
         };
 
         if self.scanline < 10 {
-            *int = int.clone().into_iter().filter(|i| i != &Interrupt::Vertical).collect();
+            *int = int
+                .clone()
+                .into_iter()
+                .filter(|i| i != &Interrupt::Vertical)
+                .collect();
         }
 
-        // TODO: This might not be correct
-        if self.scanline == 262 {
+        /*      Horizontal Size
+           13 left border + 14 right border
+
+        */
+
+        // TODO: Support PAL
+        /*      Vertical Size
+            PAL         |   NTSC
+        38 border       | 11 border
+        224 picture     | 224 picture
+        32 border       | 8 border
+        3 + 3 + 3 sync  | 3 + 3 + 3 sync
+        10 blank        | 10 blank
+        313 TOTAL       | 262 TOTAL
+         */
+
+        /*if 11 <= self.scanline && self.scanline < 224 + 11
+            && 13 <= self.get_pixel() && self.get_pixel() < 13 + self.mode4.width() as u16 {
+            let row = self.scanline as u16 - 11;
+            let col = self.get_pixel() as u16 - 13;
+            self.render_plane_pixel(sdl_system, row, col);
+        }*/
+
+        let result_2 = if self.scanline == 262 {
             // One frame has finished
             self.scanline = 0;
 
@@ -825,11 +820,15 @@ impl VdpInner {
             }
 
             self.render(sdl_system);
-        }
 
-        result
+            true
+        } else {
+            false
+        };
+
+        (result_1, result_2)
     }
-    
+
     // TODO: Make this correct
     pub fn get_pixel(&self) -> u16 {
         // *roughly* maps 489 cycles to 342 pixels

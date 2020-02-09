@@ -1,4 +1,4 @@
-use super::{log_instr, Ccr, Cpu, address_space::AddressSpace};
+use super::{address_space::AddressSpace, log_instr, Ccr, Cpu};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
@@ -315,7 +315,8 @@ impl Immediates {
         } else if self.use_sr() {
             (cpu.core.sr.0 as u32) << 8 | (cpu.core.ccr.0 as u32)
         } else {
-            self.mode.read_offset(self.size.aligned_len() as u32, self.size, cpu)
+            self.mode
+                .read_offset(self.size.aligned_len() as u32, self.size, cpu)
         }
     }
 
@@ -326,7 +327,8 @@ impl Immediates {
             cpu.core.sr.0 = (value >> 8) as u8;
             cpu.core.ccr.0 = value as u8;
         } else {
-            self.mode.write_offset(value, self.size.aligned_len() as u32, self.size, cpu)
+            self.mode
+                .write_offset(value, self.size.aligned_len() as u32, self.size, cpu)
         }
     }
 }
@@ -430,15 +432,9 @@ impl BitOperation {
         let shift_amount = shift_amount % self.shift_mod();
         let bit = 1 << shift_amount;
 
-        let immediate_len = if self.data_reg.is_some() {
-            0
-        } else {
-            2
-        };
+        let immediate_len = if self.data_reg.is_some() { 0 } else { 2 };
 
-        let mut value = self
-            .mode
-            .read_offset(immediate_len, self.data_size(), cpu);
+        let mut value = self.mode.read_offset(immediate_len, self.data_size(), cpu);
         cpu.core.ccr.set_zero(value & bit == 0);
 
         match self.op_type {
@@ -1951,7 +1947,11 @@ impl MoveP {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum MulAddExgAnd {
-    Mul{ signed: bool, op1: DataReg, op2: AddrMode },
+    Mul {
+        signed: bool,
+        op1: DataReg,
+        op2: AddrMode,
+    },
     Abcd,
     Exchange,
     And(DataReg, bool, Size, AddrMode),
@@ -1972,11 +1972,7 @@ impl TryFrom<u16> for MulAddExgAnd {
             let signed = (data >> 8) & 1 != 0;
             let op2 = AddrMode::new(data as u8 & 0x3F);
             let op1 = DataReg::new((data >> 9) as u8 & 0x7);
-            Ok(MulAddExgAnd::Mul {
-                signed,
-                op1,
-                op2,
-            })
+            Ok(MulAddExgAnd::Mul { signed, op1, op2 })
         } else if bitpat!(1 _ _ 0 0)(data >> 4) {
             unimplemented!("Exchange")
         } else {
@@ -1994,7 +1990,7 @@ impl Instr for MulAddExgAnd {
     fn size(&self) -> u32 {
         match self {
             MulAddExgAnd::And(_, _, size, mode) => 2 + mode.arg_length(*size),
-            MulAddExgAnd::Mul{ op2, .. } => 2 + op2.arg_length(Size::Word),
+            MulAddExgAnd::Mul { op2, .. } => 2 + op2.arg_length(Size::Word),
             _ => unimplemented!(),
         }
     }
@@ -2017,7 +2013,7 @@ impl Instr for MulAddExgAnd {
                     data_reg.write((result & mask) | (data_reg.read(cpu) & !mask), cpu);
                 }
             }
-            MulAddExgAnd::Mul{ signed, op1, op2 } => {
+            MulAddExgAnd::Mul { signed, op1, op2 } => {
                 if *signed {
                     todo!("Signed multiply")
                 } else {

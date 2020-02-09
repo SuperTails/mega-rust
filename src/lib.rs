@@ -8,11 +8,10 @@ mod vdp;
 
 use cart::Cart;
 use controller::Controller;
-use cpu_bindings::MusashiCpu;
+use cpu_bindings::{MusashiCpu, SYSTEM_STATE, VDP};
 use sdl_system::SDLSystem;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::time::Instant;
 use vdp::Vdp;
 
 //const Z80_DATA: &[u8; 7110] = include_bytes!("../../z80decompressed.bin");
@@ -68,34 +67,39 @@ pub struct Options {
 }
 
 pub fn run(cart: Cart, options: Options) {
-    let vdp = Arc::new(Mutex::new(Vdp::new()));
-    let controller1 = Arc::new(Mutex::new(Controller::default()));
-    let controller2 = Arc::new(Mutex::new(Controller::default()));
+    let vdp = Vdp::new();
     /*let mut cpu = cpu::Cpu::new(
         &cart.rom_data,
         Arc::downgrade(&vdp),
         Arc::downgrade(&controller1),
         Arc::downgrade(&controller2),
     );*/
-    let mut cpu2 = MusashiCpu::new(
-        &cart.rom_data,
-        Arc::downgrade(&vdp),
-        Arc::downgrade(&controller1),
-        Arc::downgrade(&controller2),
-    );
+    unsafe {
+        VDP.set(vdp).ok().unwrap();
+    };
+    let mut cpu2 = MusashiCpu::new(&cart.rom_data, Controller::default(), Controller::default());
     let mut sdl_system = SDLSystem::new();
+    sdl_system.canvas.set_scale(2.0, 2.0).unwrap();
     let hit_breakpoint = false;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
 
     cpu::do_log(options.log_instrs);
+
+    let mut frames = vec![];
 
     'running: loop {
         if hit_breakpoint {
             on_breakpoint(&mut sdl_system);
         }
 
-        controller1.lock().unwrap().update();
-        controller2.lock().unwrap().update();
+        unsafe { SYSTEM_STATE.get_mut() }
+            .unwrap()
+            .controller_1
+            .update();
+        unsafe { SYSTEM_STATE.get_mut() }
+            .unwrap()
+            .controller_2
+            .update();
 
         /*let instr = cpu.instr_at(cpu.core.pc);
 
@@ -112,10 +116,20 @@ pub fn run(cart: Cart, options: Options) {
             break 'running;
         }*/
 
-        if vdp.lock().unwrap().do_cycle(&mut sdl_system, &mut pending) {
+        let (scan_finish, frame_finish) = unsafe { VDP.get_mut() }
+            .unwrap()
+            .do_cycle(&mut sdl_system, &mut pending);
+
+        if scan_finish {
             let events: Vec<_> = sdl_system.event_pump.poll_iter().collect();
-            controller1.lock().unwrap().update_buttons(&events);
-            controller2.lock().unwrap().update_buttons(&events);
+            unsafe { SYSTEM_STATE.get_mut() }
+                .unwrap()
+                .controller_1
+                .update_buttons(&events);
+            unsafe { SYSTEM_STATE.get_mut() }
+                .unwrap()
+                .controller_2
+                .update_buttons(&events);
             for event in events {
                 match event {
                     sdl2::event::Event::KeyDown {
@@ -134,6 +148,18 @@ pub fn run(cart: Cart, options: Options) {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        if frame_finish {
+            if frames.len() == 10 {
+                frames.remove(0);
+            }
+            frames.push(Instant::now());
+            if frames.len() == 10 {
+                let time_per_frame = (frames[9] - frames[0]).as_secs_f64() / 10.0;
+
+                println!("FPS: {}", 1.0 / time_per_frame);
             }
         }
 

@@ -69,7 +69,9 @@ impl Controller {
             (Keycode::A, &mut self.states.a),
             (Keycode::S, &mut self.states.b),
             (Keycode::D, &mut self.states.c),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         for event in events.iter() {
             match event {

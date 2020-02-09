@@ -6,25 +6,25 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-use once_cell::sync::OnceCell;
-use std::sync::Weak;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::BinaryHeap;
-use crate::Interrupt;
 use crate::controller::Controller;
+use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use crate::vdp::Vdp;
-use crate::cpu::{instruction::Size, address_space::AddressSpace};
-use ::std::os::raw::{c_uint, c_int};
+use crate::Interrupt;
+use ::std::os::raw::{c_int, c_uint};
+use once_cell::sync::OnceCell;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub static mut SYSTEM_STATE: OnceCell<SystemState> = OnceCell::new();
+pub static mut VDP: OnceCell<Vdp> = OnceCell::new();
 
 pub struct SystemState {
     pub rom: Box<[u8]>,
     pub cart_ram: Box<[u8]>,
     pub ram: Box<[u8]>,
     pub z80_ram: Box<[u8]>,
-    pub vdp: Weak<Mutex<Vdp>>,
-    pub controller_1: Weak<Mutex<Controller>>,
-    pub controller_2: Weak<Mutex<Controller>>,
+    pub controller_1: Controller,
+    pub controller_2: Controller,
 }
 
 impl AddressSpace for SystemState {
@@ -41,26 +41,23 @@ impl AddressSpace for SystemState {
             return u32::from_be_bytes(*b"init");
         }
 
-        if addr == 0xA1_0000 || addr == 0xA1_0001 {
-            // TODO: Is this correct?
-            return u32::from_be_bytes(*b"UEUE") & size.mask();
-        }
-
-        if addr == 0xA1_0003 || addr == 0xA1_0004 {
-            assert_eq!(size, Size::Byte);
-            let controller1 = self.controller_1.upgrade().unwrap();
-            return controller1.lock().unwrap().read_reg1() as u32;
-        }
-
-        if addr == 0xA1_0005 || addr == 0xA1_0006 {
-            assert_eq!(size, Size::Byte);
-            let controller2 = self.controller_2.upgrade().unwrap();
-            return controller2.lock().unwrap().read_reg1() as u32;
-        }
-
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            let vdp = self.vdp.upgrade().unwrap();
-            return vdp.lock().unwrap().read(addr as u32) as u32;
+        match addr {
+            0xA1_0000..=0xA1_0001 => {
+                // TODO: Is this correct?
+                return u32::from_be_bytes(*b"UEUE") & size.mask();
+            }
+            0xA1_0002..=0xA1_0003 => {
+                assert_eq!(size, Size::Byte);
+                return self.controller_1.read_reg1() as u32;
+            }
+            0xA1_0004..=0xA1_0005 => {
+                assert_eq!(size, Size::Byte);
+                return self.controller_2.read_reg1() as u32;
+            }
+            0xC0_0000..=0xC0_000F => {
+                return unsafe { VDP.get_mut() }.unwrap().read(addr as u32) as u32;
+            }
+            _ => {}
         }
 
         let mut result = 0;
@@ -68,18 +65,16 @@ impl AddressSpace for SystemState {
         for offset in 0..length {
             result <<= 8;
             let byte_addr = addr + offset;
-            let byte = if byte_addr < self.rom.len() {
-                self.rom[byte_addr]
-            } else if byte_addr < 0x3F_FFFF {
-                self.cart_ram[byte_addr - self.rom.len()]
-            } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
-                self.ram[byte_addr - 0xFF_0000]
-            } else if (0xA0_0000..=0xA0_FFFF).contains(&byte_addr) {
+            let byte = match byte_addr {
+                0..=0x3F_FFFF if byte_addr < self.rom.len() => self.rom[byte_addr],
+                0..=0x3F_FFFF => self.cart_ram[byte_addr - self.rom.len()],
+                0xFF_0000..=0xFF_FFFF => self.ram[byte_addr - 0xFF_0000],
                 // TODO: Determine if this is specially mapped
-                self.z80_ram[byte_addr - 0xA0_0000]
-            } else {
-                println!("Unimplemented address {:#X}, reading zero", addr);
-                0
+                0xA0_0000..=0xA0_FFFF => self.z80_ram[byte_addr - 0xA0_0000],
+                _ => {
+                    println!("Unimplemented address {:#X}, reading zero", addr);
+                    0
+                }
             };
 
             result |= byte as u32;
@@ -103,21 +98,20 @@ impl AddressSpace for SystemState {
         );
 
         if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            let vdp = self.vdp.upgrade().unwrap();
-            vdp.lock().unwrap().write(addr as u32, value, size, self);
+            unsafe { VDP.get_mut() }
+                .unwrap()
+                .write(addr as u32, value, size, self);
             return;
         }
 
         match addr {
             0xA1_0003..=0xA1_0004 => {
-                let controller1 = self.controller_1.upgrade().unwrap();
-                controller1.lock().unwrap().write_reg1(value as u8);
+                self.controller_1.write_reg1(value as u8);
                 return;
             }
             0xA1_0009..=0xA1_000A => {
                 assert_eq!(size, Size::Byte);
-                let controller1 = self.controller_1.upgrade().unwrap();
-                controller1.lock().unwrap().write_reg2(value as u8);
+                self.controller_1.write_reg2(value as u8);
                 return;
             }
             0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
@@ -151,10 +145,7 @@ impl AddressSpace for SystemState {
                 return;
             }
             0xC0_0000..=0xC0_000F => {
-                self.vdp
-                    .upgrade()
-                    .unwrap()
-                    .lock()
+                unsafe { VDP.get_mut() }
                     .unwrap()
                     .write(addr as u32, value, size, self);
             }
@@ -183,84 +174,81 @@ impl AddressSpace for SystemState {
 }
 
 static POP_INT: AtomicBool = AtomicBool::new(false);
-static SYSTEM_STATE: OnceCell<Mutex<SystemState>> = OnceCell::new();
 
 fn read_memory(address: c_uint, size: Size) -> c_uint {
-    SYSTEM_STATE.get().unwrap().lock().unwrap().read(address, size)
+    unsafe { SYSTEM_STATE.get_mut() }
+        .unwrap()
+        .read(address, size)
 }
 
 fn write_memory(address: c_uint, size: Size, value: c_uint) {
-    SYSTEM_STATE.get().unwrap().lock().unwrap().write(address, value, size);
+    unsafe { SYSTEM_STATE.get_mut() }
+        .unwrap()
+        .write(address, value, size);
 }
 
 #[no_mangle]
-extern fn m68k_read_memory_8(address: c_uint) -> c_uint {
+extern "C" fn m68k_read_memory_8(address: c_uint) -> c_uint {
     read_memory(address, Size::Byte)
 }
 
 #[no_mangle]
-extern fn m68k_read_memory_16(address: c_uint) -> c_uint {
+extern "C" fn m68k_read_memory_16(address: c_uint) -> c_uint {
     read_memory(address, Size::Word)
 }
 
 #[no_mangle]
-extern fn m68k_read_memory_32(address: c_uint) -> c_uint {
+extern "C" fn m68k_read_memory_32(address: c_uint) -> c_uint {
     read_memory(address, Size::Long)
 }
 
 #[no_mangle]
-extern fn m68k_write_memory_8(address: c_uint, value: c_uint) {
+extern "C" fn m68k_write_memory_8(address: c_uint, value: c_uint) {
     write_memory(address, Size::Byte, value);
 }
 
 #[no_mangle]
-extern fn m68k_write_memory_16(address: c_uint, value: c_uint) {
+extern "C" fn m68k_write_memory_16(address: c_uint, value: c_uint) {
     write_memory(address, Size::Word, value);
 }
 
 #[no_mangle]
-extern fn m68k_write_memory_32(address: c_uint, value: c_uint) {
+extern "C" fn m68k_write_memory_32(address: c_uint, value: c_uint) {
     write_memory(address, Size::Long, value);
 }
 
-extern fn on_instruction(_pc: c_uint) {
+extern "C" fn on_instruction(_pc: c_uint) {
     //println!("PC is now {:#X}", pc);
 }
 
-extern fn on_interrupt_ack(level: c_int) -> c_int {
-    println!("Interrupt ack with level {}", level);
+extern "C" fn on_interrupt_ack(level: c_int) -> c_int {
     POP_INT.store(true, Ordering::SeqCst);
     M68K_INT_ACK_AUTOVECTOR as i32
 }
 
-pub struct MusashiCpu {
-
-}
+pub struct MusashiCpu {}
 
 impl MusashiCpu {
-    pub fn new(
-        rom_data: &[u8],
-        vdp: Weak<Mutex<Vdp>>,
-        controller_1: Weak<Mutex<Controller>>,
-        controller_2: Weak<Mutex<Controller>>
-    ) -> MusashiCpu {
+    pub fn new(rom_data: &[u8], controller_1: Controller, controller_2: Controller) -> MusashiCpu {
         let cart_ram = {
             let mut cart_ram = Vec::new();
             cart_ram.resize(0x40_0000 - rom_data.len(), 0);
             Box::from(&cart_ram[..])
         };
 
-        SYSTEM_STATE.set(
-            Mutex::new(SystemState {
-                rom: rom_data.into(),
-                vdp,
-                controller_1,
-                controller_2,
-                ram: [0; 0x1_0000][..].into(),
-                z80_ram: [0; 0x1_0000][..].into(),
-                cart_ram,
-            })
-        ).ok().unwrap();
+        unsafe {
+            SYSTEM_STATE
+                .set(SystemState {
+                    rom: rom_data.into(),
+                    controller_1,
+                    controller_2,
+                    ram: [0; 0x1_0000][..].into(),
+                    z80_ram: [0; 0x1_0000][..].into(),
+                    cart_ram,
+                })
+                .ok()
+                .unwrap()
+        };
 
         unsafe {
             m68k_init();
@@ -270,21 +258,24 @@ impl MusashiCpu {
             m68k_pulse_reset();
         };
 
-        MusashiCpu {
-
-        }
+        MusashiCpu {}
     }
 
     pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
         if POP_INT.swap(false, Ordering::SeqCst) {
-            println!("Popped {:?}", pending.pop());
-            unsafe { m68k_set_irq(0); }
+            unsafe {
+                m68k_set_irq(0);
+            }
         }
 
-        unsafe { m68k_execute(1); };
+        unsafe {
+            m68k_execute(1);
+        };
 
         if let Some(int) = pending.peek() {
-            unsafe { m68k_set_irq(*int as u32); }
+            unsafe {
+                m68k_set_irq(*int as u32);
+            }
         }
     }
 

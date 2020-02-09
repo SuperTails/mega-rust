@@ -1,5 +1,5 @@
-use crate::cpu::{instruction::Size, address_space::AddressSpace};
-use super::{VdpInner, Register, DmaMode, AccessType, RamType};
+use super::{AccessType, DmaMode, RamType, Register, VdpInner};
+use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use bitpat::bitpat;
 
 // Types:
@@ -9,8 +9,8 @@ use bitpat::bitpat;
 
 #[derive(Debug)]
 pub enum Cd {
-    Normal{ ram_type: RamType, write: bool },
-    CpuToVdp{ ram_type: RamType },
+    Normal { ram_type: RamType, write: bool },
+    CpuToVdp { ram_type: RamType },
     Special,
 }
 
@@ -19,7 +19,7 @@ impl Cd {
         assert_eq!(raw >> 6, 0);
 
         let is_dma = raw & (1 << 5) != 0;
-        let is_special = raw & (1 << 4) != 0; 
+        let is_special = raw & (1 << 4) != 0;
 
         if is_special {
             assert!(is_dma);
@@ -42,9 +42,9 @@ impl Cd {
 
             if is_dma {
                 assert!(write);
-                Cd::CpuToVdp{ ram_type }
+                Cd::CpuToVdp { ram_type }
             } else {
-                Cd::Normal{ ram_type, write }
+                Cd::Normal { ram_type, write }
             }
         }
     }
@@ -64,16 +64,12 @@ struct ControlWrite {
 fn parse_control_write(value: u32) -> ControlWrite {
     let bytes = value.to_be_bytes();
 
-    let address = ((value as u16 & 0b11) << 14)
-        | ((bytes[0] as u16 & 0b111_111) << 8)
-        | (bytes[1] as u16);
+    let address =
+        ((value as u16 & 0b11) << 14) | ((bytes[0] as u16 & 0b111_111) << 8) | (bytes[1] as u16);
 
     let cd = Cd::from_raw(((bytes[3] >> 2) & 0b0011_1100) | (bytes[0] >> 6));
 
-    ControlWrite {
-        address,
-        cd,
-    }
+    ControlWrite { address, cd }
 }
 
 /// Handles interfacing between the VDP and the rest of the system
@@ -84,7 +80,7 @@ pub struct Bus {
 impl Bus {
     pub fn new() -> Bus {
         Bus {
-            write_pending: None
+            write_pending: None,
         }
     }
 
@@ -153,7 +149,7 @@ impl Bus {
             }
             0x12 => {
                 let direction = (value >> 7) & 1 != 0;
-                // TODO: 
+                // TODO:
                 println!("IGNORING DIRECTION {}", direction);
                 let offset = (value as u16 & 0x1F) * 8;
                 vdp.window_vertical = offset;
@@ -207,10 +203,7 @@ impl Bus {
                 vdp.dma_source <<= 1;
             }
             _ => {
-                panic!(
-                    "Write of {:#X} to invalid register {:#X}",
-                    value, index
-                );
+                panic!("Write of {:#X} to invalid register {:#X}", value, index);
             }
         }
     }
@@ -225,7 +218,7 @@ impl Bus {
                 &mut vdp.vram[..],
                 &mut vdp.cram[..],
                 &mut vdp.vsram[..],
-                vdp.auto_increment as u16
+                vdp.auto_increment as u16,
             );
         }
     }
@@ -248,16 +241,17 @@ impl Bus {
         // Separate the CD and the address bits
         let ControlWrite { address, cd } = parse_control_write(value);
 
-        println!("{:#010X}, Control write was {:#X}, {:?}", value, address, cd);
-
         vdp.fill_pending = false;
 
         match cd {
-            Cd::Normal{ ram_type, write } => {
-                vdp.ram_address = AccessType{ address, write, ram_type };
-                println!("RAM address is now {:#X?}", vdp.ram_address);
+            Cd::Normal { ram_type, write } => {
+                vdp.ram_address = AccessType {
+                    address,
+                    write,
+                    ram_type,
+                };
             }
-            Cd::CpuToVdp{ ram_type } => {
+            Cd::CpuToVdp { ram_type } => {
                 vdp.dma_target = (address, ram_type);
                 vdp.cpu_copy(cpu);
             }
@@ -279,7 +273,13 @@ impl Bus {
         }
     }
 
-    fn write_word(&mut self, addr: u32, value: u16, cpu: &mut dyn AddressSpace, vdp: &mut VdpInner) {
+    fn write_word(
+        &mut self,
+        addr: u32,
+        value: u16,
+        cpu: &mut dyn AddressSpace,
+        vdp: &mut VdpInner,
+    ) {
         // TODO: Emulate this properly
         let reg = Register::decode(addr & !0x1).unwrap();
 
@@ -308,10 +308,16 @@ impl Bus {
                 println!("Ignoring write of {:#X} to HV counter", value);
             }
         }
-
     }
 
-    pub fn write(&mut self, addr: u32, mut value: u32, size: Size, cpu: &mut dyn AddressSpace, vdp: &mut VdpInner) {
+    pub fn write(
+        &mut self,
+        addr: u32,
+        mut value: u32,
+        size: Size,
+        cpu: &mut dyn AddressSpace,
+        vdp: &mut VdpInner,
+    ) {
         if size == Size::Long {
             self.write_word(addr, (value >> 16) as u16, cpu, vdp);
             self.write_word(addr, value as u16, cpu, vdp);
@@ -335,7 +341,12 @@ impl Bus {
             // TODO: The even byte should return the V counter,
             // and the odd byte shoudl return the H counter
             Register::HVCounter => vdp.get_hv_counter(),
-            Register::Data => vdp.ram_address.read(&vdp.vram[..], &vdp.cram[..], &vdp.vsram[..], vdp.auto_increment as u16),
+            Register::Data => vdp.ram_address.read(
+                &vdp.vram[..],
+                &vdp.cram[..],
+                &vdp.vsram[..],
+                vdp.auto_increment as u16,
+            ),
         }
     }
 }

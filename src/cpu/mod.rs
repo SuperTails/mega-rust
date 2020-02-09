@@ -1,14 +1,14 @@
 // TODO: Maybe remove this later?
 #![allow(dead_code)]
 
-pub mod instruction;
 pub mod address_space;
-use address_space::AddressSpace;
+pub mod instruction;
 use crate::controller::Controller;
+use crate::cpu_bindings::*;
 use crate::get_four_bytes;
 use crate::vdp::Vdp;
 use crate::Interrupt;
-use crate::cpu_bindings::*;
+use address_space::AddressSpace;
 use bitfield::bitfield;
 use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
@@ -230,8 +230,7 @@ impl Cpu {
             Size::Word,
         );
 
-        let vector =
-            u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
+        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
 
         self.core.sr.set_priority(4);
         self.core.sr.set_supervisor(true);
@@ -250,8 +249,7 @@ impl Cpu {
             Size::Word,
         );
 
-        let vector =
-            u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
+        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
 
         self.core.sr.set_priority(6);
         self.core.sr.set_supervisor(true);
@@ -333,7 +331,11 @@ impl CpuCore {
             usp: 0,
             pc: 0x0004,
             ccr: Ccr(0),
-            sr: { let mut sr = Sr(0); sr.set_supervisor(true); sr },
+            sr: {
+                let mut sr = Sr(0);
+                sr.set_supervisor(true);
+                sr
+            },
             cycle: 0,
             state: State::Reset,
         }

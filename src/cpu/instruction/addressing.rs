@@ -1,6 +1,6 @@
 use super::Size;
 use crate::cpu::log_instr;
-use crate::cpu::{Cpu, address_space::AddressSpace};
+use crate::cpu::{address_space::AddressSpace, Cpu};
 use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
