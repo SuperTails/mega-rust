@@ -1681,7 +1681,8 @@ impl Instr for Shifts {
                 }
                 ShiftType::RotateExtend => {
                     cpu.core.ccr.set_overflow(false);
-                    cpu.core.ccr.set_carry(cpu.core.ccr.extend());
+                    let x_bit = cpu.core.ccr.extend();
+                    cpu.core.ccr.set_carry(x_bit);
 
                     for _ in 0..amount {
                         let new_bit = (top_bit_mask & value) != 0;

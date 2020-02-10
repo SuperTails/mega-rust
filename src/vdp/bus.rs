@@ -1,4 +1,4 @@
-use super::{AccessType, DmaMode, RamType, Register, VdpInner};
+use super::{AccessType, DmaMode, RamType, Register, VdpInner, PlaneSize};
 use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use bitpat::bitpat;
 
@@ -122,23 +122,8 @@ impl Bus {
                 println!("Auto incr is now {:#X}", vdp.auto_increment)
             }
             0x10 => {
-                // 00 =>  256
-                // 01 =>  512
-                // 11 => 1024
-
-                let decode_size = |bits: u8| -> u16 {
-                    match bits {
-                        0b00 => 256,
-                        0b01 => 512,
-                        0b11 => 1024,
-                        0b10 => panic!("Invalid plane size"),
-                        _ => unreachable!(),
-                    }
-                };
-
-                // TODO: Why is this lint firing??
-                vdp.plane_width = decode_size(value & 0x3);
-                vdp.plane_height = decode_size((value >> 4) & 0x3);
+                vdp.plane_width = PlaneSize::from_bits(value & 0x3);
+                vdp.plane_height = PlaneSize::from_bits((value >> 4) & 0x3);
             }
             0x11 => {
                 let direction = (value >> 7) & 1 != 0;

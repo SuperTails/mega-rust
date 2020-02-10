@@ -67,7 +67,6 @@ pub struct Options {
 }
 
 pub fn run(cart: Cart, options: Options) {
-    let vdp = Vdp::new();
     /*let mut cpu = cpu::Cpu::new(
         &cart.rom_data,
         Arc::downgrade(&vdp),
@@ -75,7 +74,7 @@ pub fn run(cart: Cart, options: Options) {
         Arc::downgrade(&controller2),
     );*/
     unsafe {
-        VDP.set(vdp).ok().unwrap();
+        VDP.set(Vdp::new()).ok().unwrap();
     };
     let mut cpu2 = MusashiCpu::new(&cart.rom_data, Controller::default(), Controller::default());
     let mut sdl_system = SDLSystem::new();
@@ -87,7 +86,12 @@ pub fn run(cart: Cart, options: Options) {
 
     let mut frames = vec![];
 
+    let mut last_i = 0;
+    let mut i = 0;
+
     'running: loop {
+        i += 1;
+
         if hit_breakpoint {
             on_breakpoint(&mut sdl_system);
         }
@@ -161,6 +165,9 @@ pub fn run(cart: Cart, options: Options) {
 
                 println!("FPS: {}", 1.0 / time_per_frame);
             }
+            
+            println!("Cycles: {}", i - last_i);
+            last_i = i;
         }
 
         /*if cpu::log_instr() {

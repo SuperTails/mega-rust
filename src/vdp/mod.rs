@@ -141,8 +141,33 @@ fn swatch_from_pattern(pattern: &[u8], pixel_row: u16, pixel_col: u16) -> u8 {
 
     let data_row = &pattern[pixel_row as usize * BYTES_PER_ROW..][0..BYTES_PER_ROW];
     let pixel_byte = data_row[pixel_col as usize / 2];
-    let shift = if pixel_col % 2 == 1 { 0 } else { 4 };
-    (pixel_byte >> shift) & 0xF
+    if pixel_col % 2 == 0 {
+        (pixel_byte >> 4) & 0xF
+    } else {
+        pixel_byte & 0xF
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PlaneSize {
+    Small = 256,
+    Medium = 512,
+    Large = 1024,
+}
+
+impl PlaneSize {
+    pub fn from_bits(bits: u8) -> PlaneSize {
+        match bits {
+            0b00 => PlaneSize::Small,
+            0b01 => PlaneSize::Medium,
+            0b11 => PlaneSize::Large,
+            _ => panic!("Invalid plane size"),
+        }
+    }
+
+    pub fn mask(self) -> u16 {
+        self as u16 - 1
+    }
 }
 
 /// The Video Display Processor (VDP) handles all of the
@@ -187,8 +212,8 @@ pub struct VdpInner {
 
     horiz_scroll_addr: u16,
 
-    plane_height: u16,
-    plane_width: u16,
+    plane_height: PlaneSize,
+    plane_width: PlaneSize,
 
     bg_color: u8,
     horiz_int_period: u8,
@@ -375,6 +400,12 @@ enum HorizScrollMode {
     Individual,
 }
 
+enum Plane {
+    Window,
+    B,
+    A,
+}
+
 bitfield! {
     struct TileEntry(u16);
 
@@ -390,23 +421,12 @@ bitfield! {
 }
 
 impl VdpInner {
-    fn get_vert_scroll(&self, foreground: bool, col: usize) -> u16 {
-        let (mode, data) = self.vert_scroll_data();
-        let pair = if mode { data[col / 16] } else { data[0] };
-
-        if foreground {
-            pair.0
-        } else {
-            pair.1
-        }
-    }
-
     pub fn new() -> VdpInner {
         let mut vram = [0; 0x1_00_00];
         for (i, e) in vram.iter_mut().enumerate() {
             *e = i as u8;
         }
-
+        
         VdpInner {
             ram_address: AccessType::new(),
             mode1: VdpMode1(0),
@@ -422,8 +442,8 @@ impl VdpInner {
             window_nametable: 0,
             sprite_table_addr: 0,
             horiz_scroll_addr: 0,
-            plane_width: 0,
-            plane_height: 0,
+            plane_width: PlaneSize::Small,
+            plane_height: PlaneSize::Small,
             bg_color: 0,
             scanline: 0,
             horiz_int_period: 0,
@@ -449,20 +469,20 @@ impl VdpInner {
         }
     }
 
-    fn vert_scroll_data(&self) -> (bool, Vec<(u16, u16)>) {
-        let result = if self.mode3.vert_scroll_mode() {
+    fn get_vert_scroll(&self, col: usize, foreground: bool) -> u16 {
+        let pair = if self.mode3.vert_scroll_mode() {
             // 16 pixel columns
-            let mut result = Vec::new();
-            for idx in 0..(self.mode4.width() as usize / 16) {
-                result.push((self.vsram[idx * 2], self.vsram[idx * 2 + 1]));
-            }
-            result
+            (self.vsram[(col / 16) * 2], self.vsram[(col / 16) * 2 + 1])
         } else {
             // Whole screen
-            vec![(self.vsram[0], self.vsram[1])]
+            (self.vsram[0], self.vsram[1])
         };
 
-        (self.mode3.vert_scroll_mode(), result)
+        if foreground {
+            pair.0
+        } else {
+            pair.1
+        }
     }
 
     fn get_horiz_scroll(&self, row: usize, foreground: bool) -> u16 {
@@ -587,57 +607,54 @@ impl VdpInner {
         }
     }
 
-    fn render_plane_pixel(&self, sdl_system: &mut SDLSystem, r: u16, c: u16) {
-        let plane_cell_width = self.plane_width / 8;
+    fn plane_pixel_color(&self, r: u16, c: u16, plane: Plane) -> Option<(u8, u8, u8)> {
+        let plane_cell_width = self.plane_width as u16 / 8;
 
-        let get_color = |plane: u32| -> Option<(u8, u8, u8)> {
-            let table_addr = match plane {
-                0 => self.window_nametable,
-                1 => self.plane_b_nametable,
-                2 => self.plane_a_nametable,
-                _ => panic!(),
-            };
-
-            let vert_scroll = match plane {
-                0 => self.window_vertical,
-                1 => self.get_vert_scroll(false, r as usize),
-                2 => self.get_vert_scroll(true, r as usize),
-                _ => panic!(),
-            };
-
-            let horiz_scroll = match plane {
-                0 => self.window_horizontal,
-                1 => self.get_horiz_scroll(r as usize, false),
-                2 => self.get_horiz_scroll(r as usize, true),
-                _ => panic!(),
-            };
-
-            let row = r.wrapping_add(vert_scroll) % self.plane_height;
-            let col = c.wrapping_sub(horiz_scroll) % self.plane_width;
-
-            let cell_row = row / 8;
-            let cell_col = col / 8;
-
-            let cell = cell_row * plane_cell_width + cell_col;
-
-            let mut pixel_row = row % 8;
-            let mut pixel_col = col % 8;
-
-            let addr = table_addr.wrapping_add(cell * 2);
-
-            let tile = self.get_tile_entry(addr);
-
-            if tile.horiz_flip() {
-                pixel_col = 7 - pixel_col;
-            }
-
-            if tile.vert_flip() {
-                pixel_row = 7 - pixel_row;
-            }
-
-            self.get_pattern_color(addr, pixel_row, pixel_col)
+        let table_addr = match plane {
+            Plane::Window => self.window_nametable,
+            Plane::B => self.plane_b_nametable,
+            Plane::A => self.plane_a_nametable,
         };
 
+        let vert_scroll = match plane {
+            Plane::Window => self.window_vertical,
+            Plane::B => self.get_vert_scroll(r as usize, false),
+            Plane::A => self.get_vert_scroll(r as usize, true),
+        };
+
+        let horiz_scroll = match plane {
+            Plane::Window => self.window_horizontal,
+            Plane::B => self.get_horiz_scroll(r as usize, false),
+            Plane::A => self.get_horiz_scroll(r as usize, true),
+        };
+
+        let row = r.wrapping_add(vert_scroll) & self.plane_height.mask();
+        let col = c.wrapping_sub(horiz_scroll) & self.plane_width.mask();
+
+        let cell_row = row / 8;
+        let cell_col = col / 8;
+
+        let cell = cell_row * plane_cell_width + cell_col;
+
+        let mut pixel_row = row % 8;
+        let mut pixel_col = col % 8;
+
+        let addr = table_addr.wrapping_add(cell * 2);
+
+        let tile = self.get_tile_entry(addr);
+
+        if tile.horiz_flip() {
+            pixel_col = 7 - pixel_col;
+        }
+
+        if tile.vert_flip() {
+            pixel_row = 7 - pixel_row;
+        }
+
+        self.get_pattern_color(addr, pixel_row, pixel_col)
+    }
+
+    fn render_plane_pixel(&mut self, sdl_system: &mut SDLSystem, r: u16, c: u16) {
         // Ordering, from front to back:
         // High Priority Sprites
         // High Priority Plane A
@@ -647,15 +664,11 @@ impl VdpInner {
         // Low Priority Plane B
         // Backdrop Color
 
-        let color_z = get_color(0);
-        let color_b = get_color(1);
-        let color_a = get_color(2);
-
-        let overall_color = if let Some(c) = color_a {
+        let overall_color = if let Some(c) = self.plane_pixel_color(r, c, Plane::A) {
             c
-        } else if let Some(c) = color_b {
+        } else if let Some(c) = self.plane_pixel_color(r, c, Plane::B) {
             c
-        } else if let Some(c) = color_z {
+        } else if let Some(c) = self.plane_pixel_color(r, c, Plane::Window) {
             c
         } else {
             let bg_color = self.cram[self.bg_color as usize];
@@ -675,7 +688,7 @@ impl VdpInner {
             .unwrap();
     }
 
-    fn render_planes(&self, sdl_system: &mut SDLSystem) {
+    fn render_planes(&mut self, sdl_system: &mut SDLSystem) {
         for r in 0..self.mode2.height() as u16 {
             for c in 0..self.mode4.width() as u16 {
                 self.render_plane_pixel(sdl_system, r, c);
@@ -738,7 +751,7 @@ impl VdpInner {
         }
     }
 
-    fn render(&self, sdl_system: &mut SDLSystem) {
+    fn render(&mut self, sdl_system: &mut SDLSystem) {
         self.render_planes(sdl_system);
         self.render_vram(sdl_system);
         self.render_cram(sdl_system);
@@ -813,8 +826,6 @@ impl VdpInner {
             // One frame has finished
             self.scanline = 0;
 
-            println!("Frame finished");
-
             if self.mode2.vert_interrupt() && !int.iter().any(|i| i == &Interrupt::Vertical) {
                 int.push(Interrupt::Vertical);
             }
@@ -838,7 +849,6 @@ impl VdpInner {
     pub fn get_hv_counter(&self) -> u16 {
         let pixel = self.get_pixel();
 
-        println!("Cycle: {}", self.cycle);
         let jumped_pixel = u8::try_from(if pixel <= 0xE9 {
             pixel
         } else {

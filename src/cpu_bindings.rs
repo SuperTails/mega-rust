@@ -29,7 +29,6 @@ pub struct SystemState {
 
 impl AddressSpace for SystemState {
     fn read(&mut self, address: u32, size: Size) -> u32 {
-        let length = size.len();
         let align = size.alignment();
 
         let addr = (address & 0xFF_FF_FF) as usize;
@@ -60,27 +59,28 @@ impl AddressSpace for SystemState {
             _ => {}
         }
 
-        let mut result = 0;
+        let loc = match addr {
+            0..=0x3F_FFFF if addr < self.rom.len() => &self.rom[addr..],
+            0..=0x3F_FFFF => &self.cart_ram[addr - self.rom.len()..],
+            0xA0_0000..=0xA0_FFFF => &self.z80_ram[addr - 0xA0_0000..],
+            0xFF_0000..=0xFF_FFFF => &self.ram[addr - 0xFF_0000..],
+            _ => {
+                println!("Unimplemented address {:#08X}, reading zero", addr);
+                &[0, 0, 0, 0]
+            }
+        };
 
-        for offset in 0..length {
-            result <<= 8;
-            let byte_addr = addr + offset;
-            let byte = match byte_addr {
-                0..=0x3F_FFFF if byte_addr < self.rom.len() => self.rom[byte_addr],
-                0..=0x3F_FFFF => self.cart_ram[byte_addr - self.rom.len()],
-                0xFF_0000..=0xFF_FFFF => self.ram[byte_addr - 0xFF_0000],
-                // TODO: Determine if this is specially mapped
-                0xA0_0000..=0xA0_FFFF => self.z80_ram[byte_addr - 0xA0_0000],
-                _ => {
-                    println!("Unimplemented address {:#X}, reading zero", addr);
-                    0
-                }
-            };
-
-            result |= byte as u32;
+        match size {
+            Size::Byte => {
+                u8::from_be_bytes([loc[0]]) as u32
+            }
+            Size::Word => {
+                u16::from_be_bytes([loc[0], loc[1]]) as u32
+            }
+            Size::Long => {
+                u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32
+            }
         }
-
-        result
     }
 
     fn write(&mut self, address: u32, value: u32, size: Size) {
@@ -96,13 +96,6 @@ impl AddressSpace for SystemState {
             size,
             addr
         );
-
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            unsafe { VDP.get_mut() }
-                .unwrap()
-                .write(addr as u32, value, size, self);
-            return;
-        }
 
         match addr {
             0xA1_0003..=0xA1_0004 => {
@@ -148,6 +141,7 @@ impl AddressSpace for SystemState {
                 unsafe { VDP.get_mut() }
                     .unwrap()
                     .write(addr as u32, value, size, self);
+                return;
             }
             _ => {}
         }
@@ -221,7 +215,7 @@ extern "C" fn on_instruction(_pc: c_uint) {
     //println!("PC is now {:#X}", pc);
 }
 
-extern "C" fn on_interrupt_ack(level: c_int) -> c_int {
+extern "C" fn on_interrupt_ack(_level: c_int) -> c_int {
     POP_INT.store(true, Ordering::SeqCst);
     M68K_INT_ACK_AUTOVECTOR as i32
 }
