@@ -4,8 +4,10 @@ use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
 use bitfield::bitfield;
 use bus::Bus;
-use sdl2::pixels::Color;
-use sdl2::rect::Point;
+use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::rect::{Point, Rect};
+use sdl2::surface::Surface;
+use sdl2::render::Canvas;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
@@ -170,6 +172,11 @@ impl PlaneSize {
     }
 }
 
+fn set_pixel(target: &mut Canvas<Surface<'_>>, color: Color, point: Point) -> Result<(), String> {
+    target.set_draw_color(color);
+    target.draw_point(point)
+}
+
 /// The Video Display Processor (VDP) handles all of the
 /// rendering for the console. It has three types of RAM:
 ///
@@ -181,61 +188,6 @@ impl PlaneSize {
 /// 40x10bits VSRAM: Used to store vertical scroll data
 ///
 /// Information from segaretro.org
-pub struct VdpInner {
-    // True means write
-    ram_address: AccessType,
-    mode1: VdpMode1,
-    mode2: VdpMode2,
-    mode3: VdpMode3,
-    mode4: VdpMode4,
-
-    dma_length: u16,
-    dma_target: (u16, RamType),
-    dma_source: u32,
-    dma_mode: DmaMode,
-    fill_pending: bool,
-
-    window_horizontal: u16,
-    window_vertical: u16,
-
-    /// Address in VRAM of the beginning of the nametable
-    /// for plane A.
-    plane_a_nametable: u16,
-    /// Address in VRAM of the beginning of the nametable
-    /// for plane B.
-    plane_b_nametable: u16,
-    /// Address in VRAM of the beginning of the nametable
-    /// for the background/window.
-    window_nametable: u16,
-
-    sprite_table_addr: u16,
-
-    horiz_scroll_addr: u16,
-
-    plane_height: PlaneSize,
-    plane_width: PlaneSize,
-
-    bg_color: u8,
-    horiz_int_period: u8,
-    horiz_int_counter: u8,
-
-    auto_increment: u8,
-
-    cycle: u64,
-    scanline: u32,
-
-    /// The array representing the VDP's 64KiB of VRAM.
-    /// VRAM is used for storing graphics data, e.g.
-    /// nametable data, sprite data, and the horizontal scroll
-    vram: [u8; 0x1_00_00],
-
-    /// The array representing the VDP's 128 bytes of CRAM, used for 64 different colors.
-    cram: [CRamEntry; 0x40],
-
-    // 40 10-bit entries
-    vsram: [u16; 40],
-}
-
 pub struct Vdp {
     inner: VdpInner,
     bus: Bus,
@@ -420,6 +372,64 @@ bitfield! {
     priority, _: 15;
 }
 
+pub struct VdpInner {
+    // True means write
+    ram_address: AccessType,
+    mode1: VdpMode1,
+    mode2: VdpMode2,
+    mode3: VdpMode3,
+    mode4: VdpMode4,
+
+    target: Canvas<Surface<'static>>,
+    debug_target: Canvas<Surface<'static>>,
+
+    dma_length: u16,
+    dma_target: (u16, RamType),
+    dma_source: u32,
+    dma_mode: DmaMode,
+    fill_pending: bool,
+
+    window_horizontal: u16,
+    window_vertical: u16,
+
+    /// Address in VRAM of the beginning of the nametable
+    /// for plane A.
+    plane_a_nametable: u16,
+    /// Address in VRAM of the beginning of the nametable
+    /// for plane B.
+    plane_b_nametable: u16,
+    /// Address in VRAM of the beginning of the nametable
+    /// for the background/window.
+    window_nametable: u16,
+
+    sprite_table_addr: u16,
+
+    horiz_scroll_addr: u16,
+
+    plane_height: PlaneSize,
+    plane_width: PlaneSize,
+
+    bg_color: u8,
+    horiz_int_period: u8,
+    horiz_int_counter: u8,
+
+    auto_increment: u8,
+
+    cycle: u64,
+    scanline: u32,
+
+    /// The array representing the VDP's 64KiB of VRAM.
+    /// VRAM is used for storing graphics data, e.g.
+    /// nametable data, sprite data, and the horizontal scroll
+    vram: [u8; 0x1_00_00],
+
+    /// The array representing the VDP's 128 bytes of CRAM, used for 64 different colors.
+    cram: [CRamEntry; 0x40],
+
+    // 40 10-bit entries
+    vsram: [u16; 40],
+}
+
 impl VdpInner {
     pub fn new() -> VdpInner {
         let mut vram = [0; 0x1_00_00];
@@ -433,6 +443,8 @@ impl VdpInner {
             mode2: VdpMode2(0),
             mode3: VdpMode3(0),
             mode4: VdpMode4(0),
+            target: Surface::new(320, 224, PixelFormatEnum::RGBA8888).unwrap().into_canvas().unwrap(),
+            debug_target: Surface::new(256, 256, PixelFormatEnum::RGBA8888).unwrap().into_canvas().unwrap(),
             dma_length: 0,
             dma_target: (0, RamType::VRam),
             dma_mode: DmaMode::VramFill,
@@ -515,7 +527,7 @@ impl VdpInner {
         )
     }
 
-    fn render_sprites(&self, sdl_system: &mut SDLSystem) {
+    fn render_sprites(&mut self) {
         let sprite_table = &self.vram[self.sprite_table_addr as usize..][..640];
         // TODO: Emulate self-referencing sprites correctly
         let mut visited = [false; 80];
@@ -560,8 +572,8 @@ impl VdpInner {
                                 let point =
                                     Point::new(corner_x + dest_x as i32, corner_y + dest_y as i32);
 
-                                sdl_system.canvas.set_draw_color(color);
-                                sdl_system.canvas.draw_point(point).unwrap();
+                                set_pixel(&mut self.target, color.into(), point).unwrap();
+                                //self.set_output_pixel(sdl_system, color.into(), point).unwrap();
                             }
                         }
                     }
@@ -654,7 +666,7 @@ impl VdpInner {
         self.get_pattern_color(addr, pixel_row, pixel_col)
     }
 
-    fn render_plane_pixel(&mut self, sdl_system: &mut SDLSystem, r: u16, c: u16) {
+    fn render_plane_pixel(&mut self, r: u16, c: u16) {
         // Ordering, from front to back:
         // High Priority Sprites
         // High Priority Plane A
@@ -679,29 +691,34 @@ impl VdpInner {
             )
         };
 
-        sdl_system
+        set_pixel(&mut self.target, overall_color.into(), Point::new(c as i32, r as i32)).unwrap();
+
+        /*sdl_system
             .canvas()
             .set_draw_color(Color::from(overall_color));
         sdl_system
             .canvas()
             .draw_point(Point::new(c as i32, r as i32))
-            .unwrap();
+            .unwrap();*/
     }
 
-    fn render_planes(&mut self, sdl_system: &mut SDLSystem) {
+    fn render_planes(&mut self) {
         for r in 0..self.mode2.height() as u16 {
             for c in 0..self.mode4.width() as u16 {
-                self.render_plane_pixel(sdl_system, r, c);
+                self.render_plane_pixel(r, c);
             }
         }
     }
 
-    fn render_vram(&self, sdl_system: &mut SDLSystem) {
+    fn render_vram(&mut self, sdl_system: &mut SDLSystem) {
         for r in 0..256 {
             for c in 0..256 {
                 let entry = self.vram[r * 256 + c];
 
-                sdl_system
+                let color = Color::RGB(entry, entry, entry);
+                set_pixel(&mut self.debug_target, color, Point::new(c as i32, r as i32)).unwrap();
+
+                /*sdl_system
                     .canvas()
                     .set_draw_color(Color::RGB(entry, entry, entry));
                 sdl_system
@@ -710,7 +727,7 @@ impl VdpInner {
                         c as i32 + 8 + self.mode4.width() as i32,
                         r as i32,
                     ))
-                    .unwrap();
+                    .unwrap();*/
             }
         }
 
@@ -751,11 +768,28 @@ impl VdpInner {
         }
     }
 
+    fn render_targets(&self, sdl_system: &mut SDLSystem) {
+        let creator = sdl_system.canvas.texture_creator();
+        let tex = creator.create_texture_from_surface(self.target.surface()).unwrap();
+        let tex2 = creator.create_texture_from_surface(self.debug_target.surface()).unwrap();
+        let dest = Rect::new(0, 0, self.target.surface().width(), self.target.surface().height());
+        let dest2 = Rect::new(8 + self.mode4.width() as i32, 0, self.debug_target.surface().width(), self.target.surface().height());
+        sdl_system
+            .canvas
+            .copy(&tex, None, dest)
+            .unwrap();
+        sdl_system
+            .canvas
+            .copy(&tex2, None, dest2)
+            .unwrap();
+    }
+
     fn render(&mut self, sdl_system: &mut SDLSystem) {
-        self.render_planes(sdl_system);
+        self.render_planes();
+        self.render_sprites();
+        self.render_targets(sdl_system);
         self.render_vram(sdl_system);
         self.render_cram(sdl_system);
-        self.render_sprites(sdl_system);
         sdl_system.canvas().present();
     }
 

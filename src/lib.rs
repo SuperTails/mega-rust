@@ -114,6 +114,7 @@ pub fn run(cart: Cart, options: Options) {
 
         //cpu.do_cycle(&mut pending);
         cpu2.do_cycle(&mut pending);
+        //cpu3.do_cycle(&mut pending);
 
         /*if !cpu_eq(&cpu, &cpu2) {
             println!("Main CPU state:\n{}\nMusashi CPU state:\n{}", cpu.core, cpu::CpuCore::from(&cpu2));

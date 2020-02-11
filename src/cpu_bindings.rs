@@ -14,6 +14,7 @@ use ::std::os::raw::{c_int, c_uint};
 use once_cell::sync::OnceCell;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::CStr;
 
 pub static mut SYSTEM_STATE: OnceCell<SystemState> = OnceCell::new();
 pub static mut VDP: OnceCell<Vdp> = OnceCell::new();
@@ -197,6 +198,21 @@ extern "C" fn m68k_read_memory_32(address: c_uint) -> c_uint {
 }
 
 #[no_mangle]
+extern "C" fn m68k_read_disassembler_8(address: c_uint) -> c_uint {
+    m68k_read_memory_8(address)
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_disassembler_16(address: c_uint) -> c_uint {
+    m68k_read_memory_16(address)
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_disassembler_32(address: c_uint) -> c_uint {
+    m68k_read_memory_32(address)
+}
+
+#[no_mangle]
 extern "C" fn m68k_write_memory_8(address: c_uint, value: c_uint) {
     write_memory(address, Size::Byte, value);
 }
@@ -211,8 +227,16 @@ extern "C" fn m68k_write_memory_32(address: c_uint, value: c_uint) {
     write_memory(address, Size::Long, value);
 }
 
-extern "C" fn on_instruction(_pc: c_uint) {
-    //println!("PC is now {:#X}", pc);
+extern "C" fn on_instruction(pc: c_uint) {
+    if crate::cpu::log_instr() {
+        println!("PC is now {:#X}", pc);
+        let mut buffer = [0; 100];
+        unsafe { m68k_disassemble(buffer.as_mut_ptr() as *mut i8, pc, M68K_CPU_TYPE_68000) };
+        let nul_idx = buffer.iter().enumerate().find(|(_, i)| **i == 0).unwrap().0;
+        let buffer = &buffer[0..=nul_idx];
+        let instr = CStr::from_bytes_with_nul(buffer).unwrap();
+        println!("{:?}\n", instr);
+    }
 }
 
 extern "C" fn on_interrupt_ack(_level: c_int) -> c_int {
