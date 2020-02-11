@@ -164,25 +164,23 @@ impl CpuCore {
 
         Ok(result)
     }
-}
 
-impl From<&MusashiCpu> for CpuCore {
-    fn from(musashi: &MusashiCpu) -> CpuCore {
-        let pc = musashi.get_reg(m68k_register_t_M68K_REG_PC);
-        let full_sr = musashi.get_reg(m68k_register_t_M68K_REG_SR);
+    pub fn from_musashi() -> CpuCore {
+        let pc = MusashiCpu::get_reg(m68k_register_t_M68K_REG_PC);
+        let full_sr = MusashiCpu::get_reg(m68k_register_t_M68K_REG_SR);
         let sr = Sr((full_sr >> 8) as u8);
         let ccr = Ccr(full_sr as u8);
         let data = {
             let mut data = [0; 8];
             for (idx, d) in data.iter_mut().enumerate() {
-                *d = musashi.get_reg(m68k_register_t_M68K_REG_D0 + idx as u32);
+                *d = MusashiCpu::get_reg(m68k_register_t_M68K_REG_D0 + idx as u32);
             }
             data
         };
         let addr = {
             let mut addr = [0; 8];
             for (idx, a) in addr.iter_mut().enumerate() {
-                *a = musashi.get_reg(m68k_register_t_M68K_REG_A0 + idx as u32);
+                *a = MusashiCpu::get_reg(m68k_register_t_M68K_REG_A0 + idx as u32);
             }
             addr
         };
@@ -215,4 +213,3 @@ impl fmt::Display for CpuCore {
         write!(f, "---------------------------------")
     }
 }
-

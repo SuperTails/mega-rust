@@ -186,7 +186,7 @@ mod tests {
 }
 
 fn cpu_eq(cpu1: &cpu::Cpu, cpu2: &MusashiCpu) -> bool {
-    let mut cpu2_core: cpu::CpuCore = cpu2.into();
+    let mut cpu2_core = cpu::CpuCore::from_musashi();
     cpu2_core.cycle = cpu1.core.cycle;
     cpu2_core.usp = cpu1.core.usp;
 

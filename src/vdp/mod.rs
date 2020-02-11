@@ -692,14 +692,6 @@ impl VdpInner {
         };
 
         set_pixel(&mut self.target, overall_color.into(), Point::new(c as i32, r as i32)).unwrap();
-
-        /*sdl_system
-            .canvas()
-            .set_draw_color(Color::from(overall_color));
-        sdl_system
-            .canvas()
-            .draw_point(Point::new(c as i32, r as i32))
-            .unwrap();*/
     }
 
     fn render_planes(&mut self) {
@@ -717,17 +709,6 @@ impl VdpInner {
 
                 let color = Color::RGB(entry, entry, entry);
                 set_pixel(&mut self.debug_target, color, Point::new(c as i32, r as i32)).unwrap();
-
-                /*sdl_system
-                    .canvas()
-                    .set_draw_color(Color::RGB(entry, entry, entry));
-                sdl_system
-                    .canvas()
-                    .draw_point(Point::new(
-                        c as i32 + 8 + self.mode4.width() as i32,
-                        r as i32,
-                    ))
-                    .unwrap();*/
             }
         }
 

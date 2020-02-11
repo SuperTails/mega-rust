@@ -10,10 +10,9 @@ use crate::controller::Controller;
 use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use crate::vdp::Vdp;
 use crate::Interrupt;
-use ::std::os::raw::{c_int, c_uint};
+use ::std::os::raw::c_uint;
 use once_cell::sync::OnceCell;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::ffi::CStr;
 
 pub static mut SYSTEM_STATE: OnceCell<SystemState> = OnceCell::new();
@@ -168,8 +167,6 @@ impl AddressSpace for SystemState {
     }
 }
 
-static POP_INT: AtomicBool = AtomicBool::new(false);
-
 fn read_memory(address: c_uint, size: Size) -> c_uint {
     unsafe { SYSTEM_STATE.get_mut() }
         .unwrap()
@@ -230,6 +227,7 @@ extern "C" fn m68k_write_memory_32(address: c_uint, value: c_uint) {
 extern "C" fn on_instruction(pc: c_uint) {
     if crate::cpu::log_instr() {
         println!("PC is now {:#X}", pc);
+        println!("State is {}", crate::cpu::CpuCore::from_musashi());
         let mut buffer = [0; 100];
         unsafe { m68k_disassemble(buffer.as_mut_ptr() as *mut i8, pc, M68K_CPU_TYPE_68000) };
         let nul_idx = buffer.iter().enumerate().find(|(_, i)| **i == 0).unwrap().0;
@@ -237,11 +235,6 @@ extern "C" fn on_instruction(pc: c_uint) {
         let instr = CStr::from_bytes_with_nul(buffer).unwrap();
         println!("{:?}\n", instr);
     }
-}
-
-extern "C" fn on_interrupt_ack(_level: c_int) -> c_int {
-    POP_INT.store(true, Ordering::SeqCst);
-    M68K_INT_ACK_AUTOVECTOR as i32
 }
 
 pub struct MusashiCpu {}
@@ -272,7 +265,7 @@ impl MusashiCpu {
             m68k_init();
             m68k_set_cpu_type(M68K_CPU_TYPE_68000);
             m68k_set_instr_hook_callback(Some(on_instruction));
-            m68k_set_int_ack_callback(Some(on_interrupt_ack));
+            //m68k_set_int_ack_callback(Some(on_interrupt_ack));
             m68k_pulse_reset();
         };
 
@@ -280,24 +273,21 @@ impl MusashiCpu {
     }
 
     pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
-        if POP_INT.swap(false, Ordering::SeqCst) {
-            unsafe {
-                m68k_set_irq(0);
-            }
-        }
-
         unsafe {
             m68k_execute(1);
         };
 
         if let Some(int) = pending.peek() {
-            unsafe {
-                m68k_set_irq(*int as u32);
+            if *int as u32 > (Self::get_reg(m68k_register_t_M68K_REG_SR) >> 8) & 0x7 {
+                unsafe {
+                    m68k_set_irq(*int as u32);
+                }
+                pending.pop();
             }
         }
     }
 
-    pub fn get_reg(&self, reg: m68k_register_t) -> u32 {
+    pub fn get_reg(reg: m68k_register_t) -> u32 {
         unsafe { m68k_get_reg(std::ptr::null_mut(), reg) }
     }
 }
