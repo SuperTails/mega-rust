@@ -195,7 +195,7 @@ pub fn run(cart: Cart, options: Options) {
             &cart.rom_data,
             Controller::default(),
             Controller::default(),
-        ))
+        ).unwrap())
         .ok()
         .unwrap();
     };
@@ -239,8 +239,8 @@ mod tests {
 }
 
 #[allow(dead_code)]
-fn cpu_eq(cpu1: &cpu::Cpu) -> bool {
-    let mut cpu2_core = cpu::CpuCore::from_musashi();
+fn cpu_eq(cpu1: &cpu::Cpu, cpu2: &MusashiCpu) -> bool {
+    let mut cpu2_core = cpu::CpuCore::from_musashi(cpu2);
     cpu2_core.cycle = cpu1.core.cycle;
     cpu2_core.usp = cpu1.core.usp;
 

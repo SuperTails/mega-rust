@@ -165,22 +165,22 @@ impl CpuCore {
         Ok(result)
     }
 
-    pub fn from_musashi() -> CpuCore {
-        let pc = MusashiCpu::get_reg(Register::Pc);
-        let full_sr = MusashiCpu::get_reg(Register::Sr);
+    pub fn from_musashi(cpu: &MusashiCpu) -> CpuCore {
+        let pc = cpu.get_reg(Register::Pc);
+        let full_sr = cpu.get_reg(Register::Sr);
         let sr = Sr((full_sr >> 8) as u8);
         let ccr = Ccr(full_sr as u8);
         let data = {
             let mut data = [0; 8];
             for (idx, d) in data.iter_mut().enumerate() {
-                *d = MusashiCpu::get_reg(Register::data(idx));
+                *d = cpu.get_reg(Register::data(idx));
             }
             data
         };
         let addr = {
             let mut addr = [0; 8];
             for (idx, a) in addr.iter_mut().enumerate() {
-                *a = MusashiCpu::get_reg(Register::addr(idx));
+                *a = cpu.get_reg(Register::addr(idx));
             }
             addr
         };

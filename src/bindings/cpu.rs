@@ -12,6 +12,7 @@ use log::trace;
 use std::collections::BinaryHeap;
 use std::ffi::CStr;
 use std::os::raw::c_uint;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn read_memory(address: c_uint, size: Size) -> c_uint {
     unsafe { SYSTEM_STATE.get_mut() }
@@ -73,7 +74,8 @@ extern "C" fn m68k_write_memory_32(address: c_uint, value: c_uint) {
 extern "C" fn on_instruction(pc: c_uint) {
     if crate::cpu::log_instr() {
         trace!("PC is now {:#X}", pc);
-        trace!("State is {}", crate::cpu::CpuCore::from_musashi());
+        // TODO: We know that a cpu must exist, so we can print it, but ughhh
+        //trace!("State is {}", crate::cpu::CpuCore::from_musashi());
         let mut buffer = [0; 100];
         unsafe { m68k_disassemble(buffer.as_mut_ptr() as *mut i8, pc, M68K_CPU_TYPE_68000) };
         let nul_idx = buffer.iter().enumerate().find(|(_, i)| **i == 0).unwrap().0;
@@ -151,10 +153,20 @@ impl Register {
     }
 }
 
+// Only one instance of a `MusashiCpu` is allowed to exist at a time,
+// otherwise we can run into *gasp* soundness problems.
+// And also it just won't make sense
+static CPU_EXISTS: AtomicBool = AtomicBool::new(false);
+
 pub struct MusashiCpu {}
 
 impl MusashiCpu {
-    pub fn new(rom_data: &[u8], controller_1: Controller, controller_2: Controller) -> MusashiCpu {
+    pub fn new(rom_data: &[u8], controller_1: Controller, controller_2: Controller) -> Result<MusashiCpu, ()> {
+        // If the CPU already existed, then we can't create another
+        if CPU_EXISTS.swap(true, Ordering::SeqCst) {
+            return Err(());
+        }
+
         let cart_ram = {
             let mut cart_ram = Vec::new();
             cart_ram.resize(0x40_0000 - rom_data.len(), 0);
@@ -181,7 +193,7 @@ impl MusashiCpu {
             m68k_pulse_reset();
         };
 
-        MusashiCpu {}
+        Ok(MusashiCpu {})
     }
 
     pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
@@ -190,7 +202,7 @@ impl MusashiCpu {
         };
 
         if let Some(int) = pending.peek() {
-            if *int as u32 > (Self::get_reg(Register::Sr) >> 8) & 0x7 {
+            if *int as u32 > (self.get_reg(Register::Sr) >> 8) & 0x7 {
                 unsafe {
                     m68k_set_irq(*int as u32);
                 }
@@ -199,8 +211,15 @@ impl MusashiCpu {
         }
     }
 
-    // TODO: Replace with a proper enum
-    pub fn get_reg(reg: Register) -> u32 {
+    pub fn get_reg(&self, reg: Register) -> u32 {
         unsafe { m68k_get_reg(std::ptr::null_mut(), reg as m68k_register_t) }
+    }
+}
+
+impl Drop for MusashiCpu {
+    fn drop(&mut self) {
+        // If we're dropping a CPU that "doesn't exist,"
+        // then we have REALLY BIG PROBLEMS
+        assert!(CPU_EXISTS.swap(false, Ordering::SeqCst));
     }
 }
