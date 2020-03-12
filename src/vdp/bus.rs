@@ -1,6 +1,7 @@
-use super::{AccessType, DmaMode, RamType, Register, VdpInner, PlaneSize};
+use super::{AccessType, DmaMode, PlaneSize, RamType, Register, VdpInner};
 use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use bitpat::bitpat;
+use log::{debug, warn};
 
 // Types:
 // Set Normal Address
@@ -98,7 +99,7 @@ impl Bus {
             0x07 => vdp.bg_color = value,
             0x08 => {
                 if value != 0 {
-                    println!(
+                    warn!(
                         "Ignoring non-zero master system horizontal scroll write {:#X}",
                         value
                     )
@@ -106,7 +107,7 @@ impl Bus {
             }
             0x09 => {
                 if value != 0 {
-                    println!(
+                    warn!(
                         "Ignoring non-zero master system vertical scroll write {:#X}",
                         value
                     )
@@ -119,7 +120,7 @@ impl Bus {
             0x0E => assert_eq!(value, 0, "Nonzero bit 16"),
             0x0F => {
                 vdp.auto_increment = value;
-                println!("Auto incr is now {:#X}", vdp.auto_increment)
+                debug!("Auto incr is now {:#X}", vdp.auto_increment)
             }
             0x10 => {
                 vdp.plane_width = PlaneSize::from_bits(value & 0x3);
@@ -128,14 +129,14 @@ impl Bus {
             0x11 => {
                 let direction = (value >> 7) & 1 != 0;
                 // TODO:
-                println!("IGNORING DIRECTION {}", direction);
+                warn!("IGNORING DIRECTION {}", direction);
                 let offset = (value as u16 & 0x1F) * 8;
                 vdp.window_horizontal = offset;
             }
             0x12 => {
                 let direction = (value >> 7) & 1 != 0;
                 // TODO:
-                println!("IGNORING DIRECTION {}", direction);
+                warn!("IGNORING DIRECTION {}", direction);
                 let offset = (value as u16 & 0x1F) * 8;
                 vdp.window_vertical = offset;
             }
@@ -183,7 +184,7 @@ impl Bus {
 
                 vdp.dma_source &= 0x00_FF_FF;
                 vdp.dma_source |= (value as u32 & high_byte_mask) << 16;
-                println!("DMA source is now {:#X}", vdp.dma_target.0);
+                debug!("DMA source is now {:#X}", vdp.dma_target.0);
 
                 vdp.dma_source <<= 1;
             }
@@ -290,7 +291,7 @@ impl Bus {
                 self.write_control_port(value, vdp, cpu);
             }
             Register::HVCounter => {
-                println!("Ignoring write of {:#X} to HV counter", value);
+                warn!("Ignoring write of {:#X} to HV counter", value);
             }
         }
     }

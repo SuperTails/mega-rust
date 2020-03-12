@@ -18,6 +18,11 @@ lazy_static = "1.4.0"
 bit_reverse = "0.1"
 once_cell = "1.3.1"
 unicorn = "0.8.0"
+z80emu = "0.1"
+log = "0.4.8"
+fern = "0.5"
+chrono = "0.4.11"
 
 [build-dependencies]
 bindgen = "0.53.1"
+cc = "1.0"

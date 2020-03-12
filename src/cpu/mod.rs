@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 pub mod address_space;
-pub mod instruction;
 mod cpu_core;
+pub mod instruction;
 
 pub use cpu_core::*;
 
@@ -14,10 +14,11 @@ use crate::Interrupt;
 use address_space::AddressSpace;
 use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
+use log::{info, trace, warn};
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 lazy_static! {
     static ref LOG_INSTR: AtomicBool = AtomicBool::new(false);
@@ -31,21 +32,16 @@ pub fn log_instr() -> bool {
     LOG_INSTR.load(Ordering::SeqCst)
 }
 
-
 pub struct Cpu {
     pub vdp: Vdp,
     no_vdp: CpuNoVdp,
 }
 
 impl Cpu {
-    pub fn new(
-        rom: &[u8],
-        controller1: Controller,
-        controller2: Controller,
-    ) -> Cpu {
+    pub fn new(rom: &[u8], controller1: Controller, controller2: Controller) -> Cpu {
         Cpu {
             vdp: Vdp::new(),
-            no_vdp: CpuNoVdp::new(rom, controller1, controller2)
+            no_vdp: CpuNoVdp::new(rom, controller1, controller2),
         }
     }
 
@@ -58,7 +54,7 @@ impl Cpu {
         let instr = self.instr_at(pc);
 
         if log_instr() {
-            println!("Instr: {:?}", instr.opcode);
+            trace!("Instr: {:?}", instr.opcode);
         }
 
         let prev_sup = self.core.sr.supervisor();
@@ -82,7 +78,6 @@ impl Cpu {
             }
         }
     }
-
 }
 
 impl Deref for Cpu {
@@ -110,11 +105,7 @@ pub struct CpuNoVdp {
 }
 
 impl CpuNoVdp {
-    fn new(
-        rom: &[u8],
-        controller1: Controller,
-        controller2: Controller,
-    ) -> CpuNoVdp {
+    fn new(rom: &[u8], controller1: Controller, controller2: Controller) -> CpuNoVdp {
         let rom: Box<[u8]> = rom.into();
         let cart_ram = {
             let mut cart_ram = Vec::new();
@@ -145,7 +136,7 @@ impl CpuNoVdp {
         let vector = u32::from_be_bytes(get_four_bytes(&self.rom[offset..offset + 4]));
         let sp = u32::from_be_bytes(get_four_bytes(&self.rom[0..4]));
 
-        println!(
+        info!(
             "Using vector at {:#08X}, PC will be {:#08X}",
             offset, vector
         );
@@ -179,7 +170,7 @@ impl CpuNoVdp {
         self.core.sr.set_priority(4);
         self.core.sr.set_supervisor(true);
         self.core.pc = vector;
-        println!("Did horizontal interrupt");
+        info!("Did horizontal interrupt");
     }
 
     fn on_vertical_int(&mut self) {
@@ -198,7 +189,7 @@ impl CpuNoVdp {
         self.core.sr.set_priority(6);
         self.core.sr.set_supervisor(true);
         self.core.pc = vector;
-        println!("Did vertical interrupt");
+        info!("Did vertical interrupt");
     }
 
     fn handle_interrupts(&mut self, pending: &mut BinaryHeap<Interrupt>) {
@@ -226,7 +217,12 @@ impl AddressSpace for Cpu {
         let align = size.alignment();
 
         let addr = address & 0xFF_FF_FF;
-        assert_eq!(addr as usize & (align - 1), 0, "Misaligned read: {:#X}", addr);
+        assert_eq!(
+            addr as usize & (align - 1),
+            0,
+            "Misaligned read: {:#X}",
+            addr
+        );
 
         if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
             self.no_vdp.read(addr, size)
@@ -239,7 +235,12 @@ impl AddressSpace for Cpu {
         let align = size.alignment();
 
         let addr = address & 0xFF_FF_FF;
-        assert_eq!(addr as usize & (align - 1), 0, "Misaligned write: {:#X}", addr);
+        assert_eq!(
+            addr as usize & (align - 1),
+            0,
+            "Misaligned write: {:#X}",
+            addr
+        );
 
         if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
             self.no_vdp.write(addr, value, size)
@@ -259,7 +260,7 @@ impl AddressSpace for CpuNoVdp {
         assert_eq!(addr & (align - 1), 0, "Misaligned read: {:#X}", addr);
 
         if size == Size::Long && addr == 0xFFFF_FFFC {
-            println!("RETURNING 'init'");
+            info!("RETURNING 'init'");
             return u32::from_be_bytes(*b"init");
         }
 
@@ -297,7 +298,7 @@ impl AddressSpace for CpuNoVdp {
                 // TODO: Determine if this is specially mapped
                 self.z80_ram[byte_addr - 0xA0_0000]
             } else {
-                println!("Unimplemented address {:#X}, reading zero", addr);
+                warn!("Unimplemented address {:#X}, reading zero", addr);
                 0
             };
 
@@ -337,37 +338,35 @@ impl AddressSpace for CpuNoVdp {
             }
             0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
                 // TODO:
-                println!("Ignoring write to some stuff: {:#08X}", addr);
+                warn!("Ignoring write to some stuff: {:#08X}", addr);
                 return;
             }
             0xA1_1100..=0xA1_1101 => {
                 // TODO:
-                println!("Ignoring Z80 bus request");
+                warn!("Ignoring Z80 bus request");
                 return;
             }
             0xA1_1200 => {
                 // TODO:
-                println!("Ignoring Z80 reset");
+                warn!("Ignoring Z80 reset");
                 return;
             }
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
                 // TODO:
-                println!("Ignoring write to PSG output");
+                warn!("Ignoring write to PSG output");
                 return;
             }
             0xA1_0020..=0xA1_10FF => {
                 // Should we panic here, or not?
-                println!("Ignoring write to reserved memory");
+                warn!("Ignoring write to reserved memory");
                 return;
             }
             0xA1_30F1..=0xA1_30F2 => {
                 // TODO:
-                println!("Ignoring write of {:#X} to SRAM register", value);
+                warn!("Ignoring write of {:#X} to SRAM register", value);
                 return;
             }
-            0xC0_0000..=0xC0_000F => {
-                panic!("Attempt to access VDP from CpuNoVdp!")
-            }
+            0xC0_0000..=0xC0_000F => panic!("Attempt to access VDP from CpuNoVdp!"),
             _ => {}
         }
 
@@ -376,8 +375,7 @@ impl AddressSpace for CpuNoVdp {
         for (offset, byte) in value.iter().enumerate() {
             let byte_addr = addr + offset;
             if byte_addr < self.rom.len() {
-                //self.rom[byte_addr] = byte;
-                println!("Ignoring write to ROM at {:#010X}", byte_addr);
+                info!("Ignoring write to ROM at {:#010X}", byte_addr);
             } else if byte_addr < 0x3F_FFFF {
                 self.cart_ram[byte_addr - self.rom.len()] = *byte;
             } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
@@ -386,7 +384,7 @@ impl AddressSpace for CpuNoVdp {
                 // TODO: Determine if this is specially mapped
                 self.z80_ram[byte_addr - 0xA0_0000] = *byte;
             } else {
-                println!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
+                warn!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };
         }
     }

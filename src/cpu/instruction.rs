@@ -2,6 +2,7 @@ use super::{address_space::AddressSpace, log_instr, Ccr, Cpu};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
+use log::{trace, warn};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 pub use pages::*;
@@ -16,7 +17,7 @@ fn read_immediate(cpu: &mut Cpu, size: Size) -> u32 {
 
     let result = cpu.read(cpu.core.pc + 2, new_size);
     if size == Size::Byte && result >> 8 != 0 {
-        println!("Unused top byte of immediate: {:#X}", result >> 8);
+        warn!("Unused top byte of immediate: {:#X}", result >> 8);
     }
     result
 }
@@ -311,7 +312,7 @@ impl Immediates {
 
     fn read(&self, cpu: &mut Cpu) -> u32 {
         if self.use_ccr() {
-            (cpu.core.ccr.0 as u32)
+            cpu.core.ccr.0 as u32
         } else if self.use_sr() {
             (cpu.core.sr.0 as u32) << 8 | (cpu.core.ccr.0 as u32)
         } else {
@@ -546,7 +547,7 @@ impl Instr for Miscellaneous {
                 cpu.write(cpu.core.addr[7], stored, Size::Long);
 
                 if log_instr() {
-                    println!("Pushed return address {:#X}", stored)
+                    trace!("Pushed return address {:#X}", stored)
                 }
 
                 if let Address::Address(dest) = mode.address(false, Size::Byte, cpu) {
@@ -559,7 +560,7 @@ impl Instr for Miscellaneous {
                 if let Address::Address(dest) = mode.address(false, Size::Byte, cpu) {
                     cpu.core.pc = dest - self.size();
                     if log_instr() {
-                        println!("JMP, PC will be {:#X}", cpu.core.pc + self.size());
+                        trace!("JMP, PC will be {:#X}", cpu.core.pc + self.size());
                     }
                 } else {
                     panic!()
@@ -569,7 +570,7 @@ impl Instr for Miscellaneous {
                 // TODO: Make sure this is actually what this instruction does
                 if let Address::Address(address) = mode.address(false, Size::Long, cpu) {
                     if log_instr() {
-                        println!("Lea {:?} = {:#X}", reg, address)
+                        trace!("Lea {:?} = {:#X}", reg, address)
                     }
                     reg.write(address, cpu);
                 } else {
@@ -664,7 +665,7 @@ impl Miscellaneous {
         cpu.write(cpu.core.addr[7], reg.read(cpu), Size::Long);
         reg.write(cpu.core.addr[7], cpu);
         let disp = read_immediate(cpu, Size::Word) as i16 as i32;
-        println!("Disp: {:#X}", disp);
+        trace!("Disp: {:#X}", disp);
         cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp as u32);
     }
 
@@ -946,7 +947,7 @@ impl Instr for Branch {
                 .wrapping_add(displacement.wrapping_add(2) as u32);
 
             if log_instr() {
-                println!(
+                trace!(
                     "Branch (to subroutine) taken, PC will be {:#X}",
                     cpu.core.pc
                 );
@@ -959,7 +960,7 @@ impl Instr for Branch {
                 .pc
                 .wrapping_add(displacement.wrapping_add(2) as u32);
             if log_instr() {
-                println!("Branch taken, PC will be {:#X}", cpu.core.pc);
+                trace!("Branch taken, PC will be {:#X}", cpu.core.pc);
             }
 
             // Kind of a hack to cancel out the auto-increment
@@ -1171,9 +1172,11 @@ fn compare(dst: u32, src: u32, size: Size, is_add: bool) -> Ccr {
     };
 
     if log_instr() {
-        println!(
+        trace!(
             "Compared dst: {:#X} - src {:#X} = {:#X}",
-            dst, src, masked_result
+            dst,
+            src,
+            masked_result
         );
     }
 
@@ -1385,7 +1388,7 @@ impl Instr for ConditionsQuicks {
                     reg.write_sized(low_word as u32, Size::Word, cpu);
 
                     if log_instr() {
-                        println!("Reg is now {:#b}", reg.read(cpu));
+                        trace!("Reg is now {:#b}", reg.read(cpu));
                     }
 
                     if low_word != -1 {
@@ -2066,7 +2069,7 @@ standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) {
     cpu.core.sr.0  = (new_sr >> 8) as u8;
     cpu.core.ccr.0 = (new_sr     ) as u8;
 
-    if log_instr() { println!("Return from exception, PC will be {:#X}", cpu.core.pc) }
+    if log_instr() { trace!("Return from exception, PC will be {:#X}", cpu.core.pc) }
 
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });
@@ -2077,7 +2080,7 @@ standalone_operation!(Return, fn execute(&self, cpu: &mut Cpu) {
 
     cpu.core.pc = new;
 
-    if log_instr() { println!("Returning, PC will be {:#X}", cpu.core.pc) }
+    if log_instr() { trace!("Returning, PC will be {:#X}", cpu.core.pc) }
 
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });

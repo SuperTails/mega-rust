@@ -1,3 +1,4 @@
+use log::warn;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use std::collections::HashMap;
@@ -153,7 +154,7 @@ impl Controller {
     pub fn write_reg2(&self, value: u8) {
         // TODO:
         if value != 0x40 {
-            println!("Ignoring write to controller RW register of {:#X}", value);
+            warn!("Ignoring write to controller RW register of {:#X}", value);
         }
     }
 }

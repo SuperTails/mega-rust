@@ -1,7 +1,7 @@
-use std::fmt;
-use bitfield::bitfield;
 use super::instruction::Size;
 use crate::cpu_bindings::*;
+use bitfield::bitfield;
+use std::fmt;
 
 #[derive(Debug)]
 struct LogParseError {

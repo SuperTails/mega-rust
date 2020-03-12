@@ -1,6 +1,7 @@
 use super::Size;
 use crate::cpu::log_instr;
 use crate::cpu::{address_space::AddressSpace, Cpu};
+use log::trace;
 use std::fmt;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -71,24 +72,24 @@ impl AddrMode {
         let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
         let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8 as i8;
 
-        if log_instr() {
-            print!("Base offset of {:#X} ", offset);
-        }
-
         // False is data, true is address
         let reg_type = (index_info >> 7) != 0;
         let reg_index = (index_info >> 4) & 0x7;
         let reg_offset = if reg_type {
-            if log_instr() {
-                println!("and using register a{}", reg_index);
-            }
             cpu.core.addr[reg_index as usize]
         } else {
-            if log_instr() {
-                println!("and using register d{}", reg_index);
-            }
             cpu.core.data[reg_index as usize]
         };
+
+        if log_instr() {
+            let reg_char = if reg_type { 'a' } else { 'd' };
+            trace!(
+                "Base offset of {:#X} and using register {}{}",
+                offset,
+                reg_char,
+                reg_index
+            );
+        }
 
         if index_info & 0x7 != 0 {
             unimplemented!(

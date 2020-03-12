@@ -4,10 +4,11 @@ use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
 use bitfield::bitfield;
 use bus::Bus;
+use log::{info, warn};
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::{Point, Rect};
-use sdl2::surface::Surface;
 use sdl2::render::Canvas;
+use sdl2::surface::Surface;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
@@ -52,7 +53,7 @@ impl AccessType {
                 }
             }
         } else {
-            println!("Ignoring write of {:#X} to data register", value);
+            info!("Ignoring write of {:#X} to data register", value);
         }
 
         self.address = self.address.wrapping_add(increment);
@@ -436,15 +437,21 @@ impl VdpInner {
         for (i, e) in vram.iter_mut().enumerate() {
             *e = i as u8;
         }
-        
+
         VdpInner {
             ram_address: AccessType::new(),
             mode1: VdpMode1(0),
             mode2: VdpMode2(0),
             mode3: VdpMode3(0),
             mode4: VdpMode4(0),
-            target: Surface::new(320, 224, PixelFormatEnum::RGBA8888).unwrap().into_canvas().unwrap(),
-            debug_target: Surface::new(256, 256, PixelFormatEnum::RGBA8888).unwrap().into_canvas().unwrap(),
+            target: Surface::new(320, 224, PixelFormatEnum::RGBA8888)
+                .unwrap()
+                .into_canvas()
+                .unwrap(),
+            debug_target: Surface::new(256, 256, PixelFormatEnum::RGBA8888)
+                .unwrap()
+                .into_canvas()
+                .unwrap(),
             dma_length: 0,
             dma_target: (0, RamType::VRam),
             dma_mode: DmaMode::VramFill,
@@ -583,7 +590,7 @@ impl VdpInner {
             }
 
             if sprite.link as usize >= 80 {
-                println!("OUT OF BOUNDS SPRITE");
+                warn!("OUT OF BOUNDS SPRITE");
                 break;
             }
 
@@ -676,22 +683,25 @@ impl VdpInner {
         // Low Priority Plane B
         // Backdrop Color
 
-        let overall_color = if let Some(c) = self.plane_pixel_color(r, c, Plane::A) {
-            c
-        } else if let Some(c) = self.plane_pixel_color(r, c, Plane::B) {
-            c
-        } else if let Some(c) = self.plane_pixel_color(r, c, Plane::Window) {
-            c
-        } else {
-            let bg_color = self.cram[self.bg_color as usize];
-            (
-                (bg_color.red() as u8) << 5,
-                (bg_color.green() as u8) << 5,
-                (bg_color.blue() as u8) << 5,
-            )
-        };
+        let overall_color = self
+            .plane_pixel_color(r, c, Plane::A)
+            .or_else(|| self.plane_pixel_color(r, c, Plane::B))
+            .or_else(|| self.plane_pixel_color(r, c, Plane::Window))
+            .unwrap_or_else(|| {
+                let bg_color = self.cram[self.bg_color as usize];
+                (
+                    (bg_color.red() as u8) << 5,
+                    (bg_color.green() as u8) << 5,
+                    (bg_color.blue() as u8) << 5,
+                )
+            });
 
-        set_pixel(&mut self.target, overall_color.into(), Point::new(c as i32, r as i32)).unwrap();
+        set_pixel(
+            &mut self.target,
+            overall_color.into(),
+            Point::new(c as i32, r as i32),
+        )
+        .unwrap();
     }
 
     fn render_planes(&mut self) {
@@ -702,13 +712,18 @@ impl VdpInner {
         }
     }
 
-    fn render_vram(&mut self, sdl_system: &mut SDLSystem) {
+    fn render_vram(&mut self) {
         for r in 0..256 {
             for c in 0..256 {
                 let entry = self.vram[r * 256 + c];
 
                 let color = Color::RGB(entry, entry, entry);
-                set_pixel(&mut self.debug_target, color, Point::new(c as i32, r as i32)).unwrap();
+                set_pixel(
+                    &mut self.debug_target,
+                    color,
+                    Point::new(c as i32, r as i32),
+                )
+                .unwrap();
             }
         }
 
@@ -722,11 +737,12 @@ impl VdpInner {
             let r = table / 256;
             let c = table % 256;
 
-            sdl_system.canvas().set_draw_color(color);
-            sdl_system
-                .canvas()
-                .draw_point(Point::new(c as i32 + 256 + 128, r as i32))
-                .unwrap();
+            set_pixel(
+                &mut self.debug_target,
+                color,
+                Point::new(c as i32, r as i32),
+            )
+            .unwrap();
         }
     }
 
@@ -751,25 +767,33 @@ impl VdpInner {
 
     fn render_targets(&self, sdl_system: &mut SDLSystem) {
         let creator = sdl_system.canvas.texture_creator();
-        let tex = creator.create_texture_from_surface(self.target.surface()).unwrap();
-        let tex2 = creator.create_texture_from_surface(self.debug_target.surface()).unwrap();
-        let dest = Rect::new(0, 0, self.target.surface().width(), self.target.surface().height());
-        let dest2 = Rect::new(8 + self.mode4.width() as i32, 0, self.debug_target.surface().width(), self.target.surface().height());
-        sdl_system
-            .canvas
-            .copy(&tex, None, dest)
+        let tex = creator
+            .create_texture_from_surface(self.target.surface())
             .unwrap();
-        sdl_system
-            .canvas
-            .copy(&tex2, None, dest2)
+        let tex2 = creator
+            .create_texture_from_surface(self.debug_target.surface())
             .unwrap();
+        let dest = Rect::new(
+            0,
+            0,
+            self.target.surface().width(),
+            self.target.surface().height(),
+        );
+        let dest2 = Rect::new(
+            8 + self.mode4.width() as i32,
+            0,
+            self.debug_target.surface().width(),
+            self.target.surface().height(),
+        );
+        sdl_system.canvas.copy(&tex, None, dest).unwrap();
+        sdl_system.canvas.copy(&tex2, None, dest2).unwrap();
     }
 
     fn render(&mut self, sdl_system: &mut SDLSystem) {
         self.render_planes();
         self.render_sprites();
         self.render_targets(sdl_system);
-        self.render_vram(sdl_system);
+        self.render_vram();
         self.render_cram(sdl_system);
         sdl_system.canvas().present();
     }
@@ -896,14 +920,14 @@ impl VdpInner {
         // TODO: This may not be correct
         match self.dma_target {
             (addr, RamType::VRam) => {
-                println!("CPU to VRAM DMA with length {:#X}", self.dma_length);
+                info!("CPU to VRAM DMA with length {:#X}", self.dma_length);
                 for i in 0..self.dma_length {
                     self.vram[(addr + i) as usize] =
                         cpu.read(self.dma_source + i as u32, Size::Byte) as u8;
                 }
             }
             (addr, RamType::CRam) => {
-                println!("CPU to CRAM DMA with length {:#X}", self.dma_length);
+                info!("CPU to CRAM DMA with length {:#X}", self.dma_length);
                 for i in 0..self.dma_length / 2 {
                     // TODO: This may be somewhat off, also CRAM and VSRAM uses word wide
                     // reads I believe
@@ -918,7 +942,7 @@ impl VdpInner {
     pub fn dma_fill(&mut self, fill_value: u16) {
         match self.dma_target.1 {
             RamType::VRam => {
-                println!("DMA Fill with target {:#X} and length {:#X} of value {:#X} and auto increment {:#X}",
+                info!("DMA Fill with target {:#X} and length {:#X} of value {:#X} and auto increment {:#X}",
                          self.dma_target.0,
                          self.dma_length,
                          fill_value,
@@ -939,7 +963,7 @@ impl VdpInner {
     }
 
     pub fn vram_copy(&mut self) {
-        println!(
+        info!(
             "Doing VRAM copy from {:#X} to {:#X} of length {:#X}",
             self.dma_source, self.dma_target.0, self.dma_length
         );

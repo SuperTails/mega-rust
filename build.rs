@@ -9,6 +9,7 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("../Musashi/m68k.h")
+        .header("../Nuked-OPN2/ym3438.h")
         .blacklist_function("m68k_read_memory_(8|16|32)")
         .blacklist_function("m68k_read_disassembler_(8|16|32)")
         .blacklist_function("m68k_write_memory_(8|16|32)")
@@ -20,4 +21,9 @@ fn main() {
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Failed to write bindings");
+
+    cc::Build::new()
+        .opt_level(2)
+        .file("../Nuked-OPN2/ym3438.c")
+        .compile("opn2");
 }
