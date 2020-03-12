@@ -1,5 +1,5 @@
 use super::instruction::Size;
-use crate::cpu_bindings::*;
+use crate::bindings::cpu::{MusashiCpu, Register};
 use bitfield::bitfield;
 use std::fmt;
 
@@ -166,21 +166,21 @@ impl CpuCore {
     }
 
     pub fn from_musashi() -> CpuCore {
-        let pc = MusashiCpu::get_reg(m68k_register_t_M68K_REG_PC);
-        let full_sr = MusashiCpu::get_reg(m68k_register_t_M68K_REG_SR);
+        let pc = MusashiCpu::get_reg(Register::Pc);
+        let full_sr = MusashiCpu::get_reg(Register::Sr);
         let sr = Sr((full_sr >> 8) as u8);
         let ccr = Ccr(full_sr as u8);
         let data = {
             let mut data = [0; 8];
             for (idx, d) in data.iter_mut().enumerate() {
-                *d = MusashiCpu::get_reg(m68k_register_t_M68K_REG_D0 + idx as u32);
+                *d = MusashiCpu::get_reg(Register::data(idx));
             }
             data
         };
         let addr = {
             let mut addr = [0; 8];
             for (idx, a) in addr.iter_mut().enumerate() {
-                *a = MusashiCpu::get_reg(m68k_register_t_M68K_REG_A0 + idx as u32);
+                *a = MusashiCpu::get_reg(Register::addr(idx));
             }
             addr
         };

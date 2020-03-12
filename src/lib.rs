@@ -1,15 +1,16 @@
+mod bindings;
 pub mod cart;
 mod controller;
 mod cpu;
-mod cpu_bindings;
 mod joypad;
 mod sdl_system;
 mod vdp;
 mod z80;
 
+use bindings::cpu::MusashiCpu;
+use bindings::{SYSTEM_STATE, VDP, Z80};
 use cart::Cart;
 use controller::Controller;
-use cpu_bindings::{MusashiCpu, SYSTEM_STATE, VDP, Z80};
 use log::info;
 pub use log::LevelFilter;
 use once_cell::sync::OnceCell;

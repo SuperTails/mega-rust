@@ -1,6 +1,6 @@
+use crate::bindings::ym3438::Ym3438;
 use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
-use crate::cpu_bindings::Ym3438;
 use sdl2::audio::AudioCallback;
 use std::cell::RefCell;
 use std::num::{NonZeroU16, NonZeroU8};
@@ -68,7 +68,7 @@ impl Memory for Z80Control {
             0x6000..=0x60FF => 0xFF,
             0x6100..=0x7EFF => panic!("Reserved memory"),
             0x7F00..=0x7FFF => todo!("VDP"),
-            0x8000..=0xFFFF => unsafe { crate::cpu_bindings::SYSTEM_STATE.get_mut() }
+            0x8000..=0xFFFF => unsafe { crate::bindings::SYSTEM_STATE.get_mut() }
                 .unwrap()
                 .read((self.bank_address << 15) | address as u32, Size::Byte)
                 as u8,
