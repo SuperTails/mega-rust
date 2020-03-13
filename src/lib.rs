@@ -2,7 +2,6 @@ mod bindings;
 pub mod cart;
 mod controller;
 mod cpu;
-mod joypad;
 mod sdl_system;
 mod vdp;
 mod z80;
@@ -123,7 +122,7 @@ fn on_frame(frames: &mut Vec<Instant>, i: &mut u32, last_i: &mut u32) {
     *last_i = *i;
 }
 
-fn init_sdl(md_sound: z80::MdAudio) -> SDLSystem {
+fn init_sdl(md_sound: z80::MdAudio, silent: bool) -> SDLSystem {
     let mut sdl_system = SDLSystem::new();
     sdl_system.canvas.set_scale(2.0, 2.0).unwrap();
 
@@ -138,7 +137,10 @@ fn init_sdl(md_sound: z80::MdAudio) -> SDLSystem {
             .open_playback(None, &desired, move |_spec| md_sound)
             .unwrap(),
     );
-    sdl_system.audio_device.as_ref().unwrap().resume();
+
+    if !silent {
+        sdl_system.audio_device.as_ref().unwrap().resume();
+    }
 
     sdl_system
 }
@@ -183,6 +185,7 @@ fn init_logger(level: LevelFilter) -> Result<(), fern::InitError> {
 pub struct Options {
     pub trace_instructions: bool,
     pub log_level: LevelFilter,
+    pub silent: bool,
 }
 
 pub fn run(cart: Cart, options: Options) {
@@ -203,7 +206,7 @@ pub fn run(cart: Cart, options: Options) {
 
     let hit_breakpoint = false;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
-    let mut sdl_system = init_sdl(md_audio);
+    let mut sdl_system = init_sdl(md_audio, options.silent);
 
     cpu::do_log(options.trace_instructions);
 
