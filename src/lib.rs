@@ -186,6 +186,7 @@ pub struct Options {
     pub trace_instructions: bool,
     pub log_level: LevelFilter,
     pub silent: bool,
+    pub vdp_debug: bool,
 }
 
 pub fn run(cart: Cart, options: Options) {
@@ -194,7 +195,7 @@ pub fn run(cart: Cart, options: Options) {
     let md_audio = MdAudio::new();
 
     unsafe {
-        VDP.set(Vdp::new()).ok().unwrap();
+        VDP.set(Vdp::new(options.vdp_debug)).ok().unwrap();
         Z80.set(Z80::new(md_audio.clone())).ok().unwrap();
         PSG.set(Psg::new(md_audio.clone())).ok().unwrap();
         CPU.set(

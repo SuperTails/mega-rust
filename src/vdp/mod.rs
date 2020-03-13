@@ -2,139 +2,24 @@ use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
 use crate::sdl_system::SDLSystem;
 use crate::Interrupt;
+use access_type::AccessType;
 use bitfield::bitfield;
 use bus::Bus;
 use log::{info, warn};
+use plane::{NormalPlane, Plane, WindowPlane};
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::{Point, Rect};
 use sdl2::render::Canvas;
 use sdl2::surface::Surface;
+use sprite_entry::SpriteEntry;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
 
+mod access_type;
 mod bus;
-
-#[derive(Debug)]
-struct AccessType {
-    pub address: u16,
-    pub write: bool,
-    pub ram_type: RamType,
-}
-
-impl AccessType {
-    pub fn new() -> AccessType {
-        AccessType {
-            address: 0,
-            write: false,
-            ram_type: RamType::VRam,
-        }
-    }
-
-    pub fn write(
-        &mut self,
-        value: u16,
-        vram: &mut [u8],
-        cram: &mut [CRamEntry],
-        vsram: &mut [u16],
-        increment: u16,
-    ) {
-        if self.write {
-            match self.ram_type {
-                RamType::VRam => {
-                    vram[self.address as usize..][0..2].copy_from_slice(&value.to_be_bytes())
-                }
-                RamType::CRam => cram[(self.address as usize / 2) % cram.len()].0 = value,
-                RamType::VSRam => {
-                    let address = (self.address & 0x4F) / 2;
-                    let value = value & 0x3FF;
-
-                    vsram[address as usize] = value;
-                }
-            }
-        } else {
-            info!("Ignoring write of {:#X} to data register", value);
-        }
-
-        self.address = self.address.wrapping_add(increment);
-    }
-
-    pub fn read(&mut self, vram: &[u8], cram: &[CRamEntry], vsram: &[u16], increment: u16) -> u16 {
-        let result = if !self.write {
-            match self.ram_type {
-                RamType::VRam => {
-                    ((vram[self.address as usize] as u16) << 8)
-                        | vram[self.address as usize + 1] as u16
-                }
-                RamType::CRam => cram[(self.address as usize / 2) % cram.len()].0,
-                RamType::VSRam => {
-                    let address = (self.address & 0x4F) / 2;
-                    vsram[address as usize] & 0x3FF
-                }
-            }
-        } else {
-            panic!("Attempt to read from VDP when in write mode")
-        };
-
-        self.address = self.address.wrapping_add(increment);
-
-        result
-    }
-}
-
-#[derive(Debug)]
-struct SpriteEntry {
-    y: u16,
-    /// Width of the sprite, measured in cells
-    width: u8,
-    /// Height of the sprite, measured in cells
-    height: u8,
-    /// Index in the sprite attribute table of the next sprite, or zero if none
-    link: u8,
-    pattern_start_index: u16,
-    horizontal_flip: bool,
-    vertical_flip: bool,
-    palette_line: u8,
-    priority: bool,
-    x: u16,
-}
-
-impl From<&[u8]> for SpriteEntry {
-    fn from(data: &[u8]) -> SpriteEntry {
-        assert_eq!(data.len(), 8);
-
-        let mut d = [0; 8];
-        d.copy_from_slice(data);
-        SpriteEntry::from_array(d)
-    }
-}
-
-impl SpriteEntry {
-    fn from_array(data: [u8; 8]) -> SpriteEntry {
-        let y = (((data[0] as u16) << 8) | data[1] as u16) & 0x3FF;
-        let height = 1 + (data[2] & 0x3);
-        let width = 1 + ((data[2] >> 2) & 0x3);
-        let link = data[3] & 0x7F;
-        let pattern_start_index = (((data[4] as u16) << 8) | data[5] as u16) & 0x7FF;
-        let horizontal_flip = data[4] & (1 << 3) != 0;
-        let vertical_flip = data[4] & (1 << 4) != 0;
-        let palette_line = (data[4] >> 5) & 0x3;
-        let priority = data[4] & (1 << 7) != 0;
-        let x = (((data[6] as u16) << 8) | data[7] as u16) & 0x3FF;
-        SpriteEntry {
-            y,
-            height,
-            width,
-            link,
-            pattern_start_index,
-            horizontal_flip,
-            vertical_flip,
-            palette_line,
-            priority,
-            x,
-        }
-    }
-}
+mod plane;
+mod sprite_entry;
 
 fn swatch_from_pattern(pattern: &[u8], pixel_row: u16, pixel_col: u16) -> u8 {
     assert!(pixel_col < 8);
@@ -353,7 +238,7 @@ enum HorizScrollMode {
     Individual,
 }
 
-enum Plane {
+enum PlaneType {
     Window,
     B,
     A,
@@ -390,18 +275,9 @@ pub struct VdpInner {
     dma_mode: DmaMode,
     fill_pending: bool,
 
-    window_horizontal: u16,
-    window_vertical: u16,
-
-    /// Address in VRAM of the beginning of the nametable
-    /// for plane A.
-    plane_a_nametable: u16,
-    /// Address in VRAM of the beginning of the nametable
-    /// for plane B.
-    plane_b_nametable: u16,
-    /// Address in VRAM of the beginning of the nametable
-    /// for the background/window.
-    window_nametable: u16,
+    window: WindowPlane,
+    plane_a: NormalPlane,
+    plane_b: NormalPlane,
 
     sprite_table_addr: u16,
 
@@ -429,10 +305,12 @@ pub struct VdpInner {
 
     // 40 10-bit entries
     vsram: [u16; 40],
+
+    debug_render: bool,
 }
 
 impl VdpInner {
-    pub fn new() -> VdpInner {
+    pub fn new(debug_render: bool) -> VdpInner {
         let mut vram = [0; 0x1_00_00];
         for (i, e) in vram.iter_mut().enumerate() {
             *e = i as u8;
@@ -456,9 +334,9 @@ impl VdpInner {
             dma_target: (0, RamType::VRam),
             dma_mode: DmaMode::VramFill,
             fill_pending: false,
-            plane_a_nametable: 0,
-            plane_b_nametable: 0,
-            window_nametable: 0,
+            plane_a: NormalPlane::new_a(),
+            plane_b: NormalPlane::new_b(),
+            window: Default::default(),
             sprite_table_addr: 0,
             horiz_scroll_addr: 0,
             plane_width: PlaneSize::Small,
@@ -467,14 +345,13 @@ impl VdpInner {
             scanline: 0,
             horiz_int_period: 0,
             horiz_int_counter: 0,
-            window_horizontal: 0,
-            window_vertical: 0,
             dma_source: 0,
             cycle: 0,
             auto_increment: 0,
             vram,
             cram: [CRamEntry(0); 0x40],
             vsram: [0; 40],
+            debug_render,
         }
     }
 
@@ -488,6 +365,7 @@ impl VdpInner {
         }
     }
 
+    /// B is false, A is true
     fn get_vert_scroll(&self, col: usize, foreground: bool) -> u16 {
         let pair = if self.mode3.vert_scroll_mode() {
             // 16 pixel columns
@@ -626,52 +504,13 @@ impl VdpInner {
         }
     }
 
-    fn plane_pixel_color(&self, r: u16, c: u16, plane: Plane) -> Option<(u8, u8, u8)> {
-        let plane_cell_width = self.plane_width as u16 / 8;
-
-        let table_addr = match plane {
-            Plane::Window => self.window_nametable,
-            Plane::B => self.plane_b_nametable,
-            Plane::A => self.plane_a_nametable,
-        };
-
-        let vert_scroll = match plane {
-            Plane::Window => self.window_vertical,
-            Plane::B => self.get_vert_scroll(r as usize, false),
-            Plane::A => self.get_vert_scroll(r as usize, true),
-        };
-
-        let horiz_scroll = match plane {
-            Plane::Window => self.window_horizontal,
-            Plane::B => self.get_horiz_scroll(r as usize, false),
-            Plane::A => self.get_horiz_scroll(r as usize, true),
-        };
-
-        let row = r.wrapping_add(vert_scroll) & self.plane_height.mask();
-        let col = c.wrapping_sub(horiz_scroll) & self.plane_width.mask();
-
-        let cell_row = row / 8;
-        let cell_col = col / 8;
-
-        let cell = cell_row * plane_cell_width + cell_col;
-
-        let mut pixel_row = row % 8;
-        let mut pixel_col = col % 8;
-
-        let addr = table_addr.wrapping_add(cell * 2);
-
-        let tile = self.get_tile_entry(addr);
-
-        if tile.horiz_flip() {
-            pixel_col = 7 - pixel_col;
+    fn plane_pixel_color(&self, r: u16, c: u16, plane: PlaneType) -> Option<(u8, u8, u8)> {
+        match plane {
+            PlaneType::Window => self.window.pixel_color(r, c, self),
+            PlaneType::B => self.plane_b.pixel_color(r, c, self),
+            PlaneType::A => self.plane_a.pixel_color(r, c, self),
         }
-
-        if tile.vert_flip() {
-            pixel_row = 7 - pixel_row;
-        }
-
-        self.get_pattern_color(addr, pixel_row, pixel_col)
-    }
+   }
 
     fn render_plane_pixel(&mut self, r: u16, c: u16) {
         // Ordering, from front to back:
@@ -684,9 +523,9 @@ impl VdpInner {
         // Backdrop Color
 
         let overall_color = self
-            .plane_pixel_color(r, c, Plane::A)
-            .or_else(|| self.plane_pixel_color(r, c, Plane::B))
-            .or_else(|| self.plane_pixel_color(r, c, Plane::Window))
+            .plane_pixel_color(r, c, PlaneType::A)
+            .or_else(|| self.plane_pixel_color(r, c, PlaneType::B))
+            .or_else(|| self.plane_pixel_color(r, c, PlaneType::Window))
             .unwrap_or_else(|| {
                 let bg_color = self.cram[self.bg_color as usize];
                 (
@@ -728,9 +567,9 @@ impl VdpInner {
         }
 
         let tables = [
-            (Color::RGB(255, 0, 0), self.plane_a_nametable),
-            (Color::RGB(0, 255, 0), self.plane_b_nametable),
-            (Color::RGB(0, 0, 255), self.window_nametable),
+            (Color::RGB(255, 0, 0), self.plane_a.nametable),
+            (Color::RGB(0, 255, 0), self.plane_b.nametable),
+            (Color::RGB(0, 0, 255), self.window.nametable),
         ];
 
         for (color, table) in tables.iter().copied() {
@@ -770,31 +609,36 @@ impl VdpInner {
         let tex = creator
             .create_texture_from_surface(self.target.surface())
             .unwrap();
-        let tex2 = creator
-            .create_texture_from_surface(self.debug_target.surface())
-            .unwrap();
         let dest = Rect::new(
             0,
             0,
             self.target.surface().width(),
             self.target.surface().height(),
         );
-        let dest2 = Rect::new(
-            8 + self.mode4.width() as i32,
-            0,
-            self.debug_target.surface().width(),
-            self.target.surface().height(),
-        );
         sdl_system.canvas.copy(&tex, None, dest).unwrap();
-        sdl_system.canvas.copy(&tex2, None, dest2).unwrap();
+ 
+        if self.debug_render {
+            let tex2 = creator
+                .create_texture_from_surface(self.debug_target.surface())
+                .unwrap();
+            let dest2 = Rect::new(
+                8 + self.mode4.width() as i32,
+                0,
+                self.debug_target.surface().width(),
+                self.debug_target.surface().height(),
+            );
+            sdl_system.canvas.copy(&tex2, None, dest2).unwrap();
+        }
     }
 
     fn render(&mut self, sdl_system: &mut SDLSystem) {
         self.render_planes();
         self.render_sprites();
         self.render_targets(sdl_system);
-        self.render_vram();
-        self.render_cram(sdl_system);
+        if self.debug_render {
+            self.render_vram();
+            self.render_cram(sdl_system);
+        }
         sdl_system.canvas().present();
     }
 
@@ -974,9 +818,9 @@ impl VdpInner {
 }
 
 impl Vdp {
-    pub fn new() -> Vdp {
+    pub fn new(debug_render: bool) -> Vdp {
         Vdp {
-            inner: VdpInner::new(),
+            inner: VdpInner::new(debug_render),
             bus: Bus::new(),
         }
     }

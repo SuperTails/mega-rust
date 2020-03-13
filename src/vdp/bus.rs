@@ -1,4 +1,4 @@
-use super::{AccessType, DmaMode, PlaneSize, RamType, Register, VdpInner};
+use super::{access_type::AccessType, DmaMode, PlaneSize, RamType, Register, VdpInner};
 use crate::cpu::{address_space::AddressSpace, instruction::Size};
 use bitpat::bitpat;
 use log::{debug, warn};
@@ -91,9 +91,9 @@ impl Bus {
         match index {
             0x00 => vdp.mode1.0 = value,
             0x01 => vdp.mode2.0 = value,
-            0x02 => vdp.plane_a_nametable = value as u16 * 0x0400,
-            0x03 => vdp.window_nametable = value as u16 * 0x400,
-            0x04 => vdp.plane_b_nametable = value as u16 * 0x2000,
+            0x02 => vdp.plane_a.nametable = value as u16 * 0x0400,
+            0x03 => vdp.window.nametable = value as u16 * 0x400,
+            0x04 => vdp.plane_b.nametable = value as u16 * 0x2000,
             0x05 => vdp.sprite_table_addr = value as u16 * 0x200,
             0x06 => assert_eq!(value, 0, "Nonzero bit 16 of sprite table address"),
             0x07 => vdp.bg_color = value,
@@ -131,14 +131,14 @@ impl Bus {
                 // TODO:
                 warn!("IGNORING DIRECTION {}", direction);
                 let offset = (value as u16 & 0x1F) * 8;
-                vdp.window_horizontal = offset;
+                vdp.window.horizontal_scroll = offset;
             }
             0x12 => {
                 let direction = (value >> 7) & 1 != 0;
                 // TODO:
                 warn!("IGNORING DIRECTION {}", direction);
                 let offset = (value as u16 & 0x1F) * 8;
-                vdp.window_vertical = offset;
+                vdp.window.vertical_scroll = offset;
             }
             0x13 => {
                 vdp.dma_length >>= 1;

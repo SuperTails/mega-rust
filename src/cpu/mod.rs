@@ -38,9 +38,9 @@ pub struct Cpu {
 }
 
 impl Cpu {
-    pub fn new(rom: &[u8], controller1: Controller, controller2: Controller) -> Cpu {
+    pub fn new(rom: &[u8], controller1: Controller, controller2: Controller, vdp_debug: bool) -> Cpu {
         Cpu {
-            vdp: Vdp::new(),
+            vdp: Vdp::new(vdp_debug),
             no_vdp: CpuNoVdp::new(rom, controller1, controller2),
         }
     }
