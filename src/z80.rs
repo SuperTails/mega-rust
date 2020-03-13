@@ -7,13 +7,35 @@ use std::num::{NonZeroU16, NonZeroU8};
 use std::sync::{Arc, Mutex};
 use z80emu::{host::cycles, Clock, Cpu, Io, Memory, Z80NMOS};
 
-pub struct MdAudio(Arc<Mutex<[f32; 1024]>>);
+#[derive(Clone)]
+pub struct MdAudio(Arc<Mutex<([f32; 2048], usize, usize)>>);
+
+impl MdAudio {
+    pub fn new() -> MdAudio {
+        MdAudio(Arc::new(Mutex::new(([0.0; 2048], 0, 0))))
+    }
+
+    pub fn add_ym_sample(&self, _value: f32) {
+        // TODO: Add them together
+        /*let locked = self.0.lock().unwrap();
+        locked.0[locked.1] = value;
+        locked.1 += 1;*/
+    }
+
+    pub fn add_psg_sample(&self, value: f32) {
+        let mut locked = self.0.lock().unwrap();
+        let idx = locked.2;
+        // TODO: Adjust volume properly
+        locked.0[idx] = value / 1000.0;
+        locked.2 = (locked.2 + 1) % 2048;
+    }
+}
 
 impl AudioCallback for MdAudio {
     type Channel = f32;
 
     fn callback(&mut self, data: &mut [Self::Channel]) {
-        data.copy_from_slice(&self.0.lock().unwrap()[..]);
+        data.copy_from_slice(&self.0.lock().unwrap().0[..]);
     }
 }
 
@@ -61,13 +83,12 @@ impl Memory for Z80Control {
         match address {
             0x0000..=0x1FFF => self.ram[address as usize],
             0x2000..=0x3FFF => self.ram[address as usize - 0x2000],
-            0x4000..=0x5FFF => self
-                .ym_chip
-                .borrow_mut()
-                .read((address as u32 - 0x4000) % 4),
-            0x6000..=0x60FF => 0xFF,
-            0x6100..=0x7EFF => panic!("Reserved memory"),
-            0x7F00..=0x7FFF => todo!("VDP"),
+            0x4000..=0x4003 => self.ym_chip.borrow_mut().read(address as u32 - 0x4000),
+            0x4004..=0x5FFF => panic!("Reserved memory"),
+            0x6000..=0x6000 => 0xFF, // Read from bank register
+            0x6001..=0x7F10 => panic!("Reserved memory"),
+            0x7F11..=0x7F11 => unsafe { crate::bindings::PSG.get_mut() }.unwrap().read(),
+            0x7F12..=0x7FFF => todo!("VDP"),
             0x8000..=0xFFFF => unsafe { crate::bindings::SYSTEM_STATE.get_mut() }
                 .unwrap()
                 .read((self.bank_address << 15) | address as u32, Size::Byte)
@@ -79,11 +100,9 @@ impl Memory for Z80Control {
         match address {
             0x0000..=0x1FFF => self.ram[address as usize] = value,
             0x2000..=0x3FFF => self.ram[address as usize - 0x2000] = value,
-            0x4000..=0x5FFF => self
-                .ym_chip
-                .get_mut()
-                .write((address as u32 - 0x4000) % 4, value),
-            0x6000..=0x60FF => {
+            0x4000..=0x4003 => self.ym_chip.get_mut().write(address as u32 - 0x4000, value),
+            0x4004..=0x5FFF => panic!("Reserved memory"),
+            0x6000..=0x6000 => {
                 let mask = 1 << (self.bank_address_bit + 15);
                 self.bank_address_bit += 1;
                 self.bank_address_bit %= 9;
@@ -94,8 +113,11 @@ impl Memory for Z80Control {
                     self.bank_address &= !mask;
                 }
             }
-            0x6100..=0x7EFF => panic!("Reserved memory"),
-            0x7F00..=0x7FFF => todo!("VDP"),
+            0x6001..=0x7F10 => panic!("Reserved memory"),
+            0x7F11..=0x7F11 => unsafe { crate::bindings::PSG.get_mut() }
+                .unwrap()
+                .write(value),
+            0x7F12..=0x7FFF => todo!("What is this?"),
             0x8000..=0xFFFF => todo!("Bank area"),
         }
     }
@@ -162,27 +184,21 @@ pub struct Z80 {
     cpu: Z80NMOS,
     pub stopped: bool,
     cycle_count: u8,
-    audio_data: Arc<Mutex<[f32; 1024]>>,
-    idx: usize,
+    audio_data: MdAudio,
 }
 
 impl Z80 {
-    pub fn new() -> (MdAudio, Z80) {
+    pub fn new(audio_data: MdAudio) -> Z80 {
         let mut cpu = Z80NMOS::new();
         cpu.reset();
-        let audio_data = Arc::new(Mutex::new([0.0; 1024]));
-        (
-            MdAudio(Arc::clone(&audio_data)),
-            Z80 {
-                control: Z80Control::new(),
-                clock: Z80Clock::new(),
-                cpu: Default::default(),
-                stopped: true,
-                cycle_count: 0,
-                idx: 0,
-                audio_data,
-            },
-        )
+        Z80 {
+            control: Z80Control::new(),
+            clock: Z80Clock::new(),
+            cpu: Default::default(),
+            stopped: true,
+            cycle_count: 0,
+            audio_data,
+        }
     }
 
     pub fn read_ext(&mut self, addr: u16, cpu: &mut dyn AddressSpace) -> u8 {
@@ -196,6 +212,26 @@ impl Z80 {
             0x8000..=0xFFFF => {
                 cpu.read(self.control.bank_address << 15 | addr as u32, Size::Byte) as u8
             }
+        }
+    }
+
+    pub fn write_ext(&mut self, addr: u16, value: u8, cpu: &mut dyn AddressSpace) {
+        match addr {
+            0x0000..=0x1FFF => self.control.ram[addr as usize] = value,
+            0x2000..=0x3FFF => self.control.ram[addr as usize - 0x2000] = value,
+            0x4000..=0x5FFF => self
+                .control
+                .ym_chip
+                .get_mut()
+                .write((addr as u32) % 4, value),
+            0x6000..=0x60FF => todo!("Bank address register"),
+            0x6100..=0x7EFF => panic!("Unused"),
+            0x7F00..=0x7FFF => todo!("VDP"),
+            0x8000..=0xFFFF => cpu.write(
+                self.control.bank_address << 15 | addr as u32,
+                value as u32,
+                Size::Byte,
+            ),
         }
     }
 
@@ -218,10 +254,7 @@ impl Z80 {
             let o = self.control.ym_chip.get_mut().clock();
             let o2 = (o.0 as f32 + o.1 as f32) / 1_000.0;
 
-            self.audio_data.lock().unwrap()[self.idx] = o2;
-
-            self.idx += 1;
-            self.idx %= 1024;
+            self.audio_data.add_ym_sample(o2);
         }
     }
 }

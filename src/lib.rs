@@ -8,7 +8,8 @@ mod vdp;
 mod z80;
 
 use bindings::cpu::MusashiCpu;
-use bindings::{SYSTEM_STATE, VDP, Z80};
+use bindings::psg::Psg;
+use bindings::{PSG, SYSTEM_STATE, VDP, Z80};
 use cart::Cart;
 use controller::Controller;
 use log::info;
@@ -19,7 +20,7 @@ use sdl_system::SDLSystem;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 use vdp::Vdp;
-use z80::Z80;
+use z80::{MdAudio, Z80};
 
 //const Z80_DATA: &[u8; 7110] = include_bytes!("../../z80decompressed.bin");
 
@@ -127,7 +128,7 @@ fn init_sdl(md_sound: z80::MdAudio) -> SDLSystem {
     sdl_system.canvas.set_scale(2.0, 2.0).unwrap();
 
     let desired = AudioSpecDesired {
-        freq: Some(16000),
+        freq: Some(44100),
         channels: Some(1),
         samples: None,
     };
@@ -153,6 +154,7 @@ fn update(pending: &mut BinaryHeap<Interrupt>, sdl_system: &mut SDLSystem) -> (b
         .update();
     unsafe { CPU.get_mut() }.unwrap().do_cycle(pending);
     unsafe { Z80.get_mut() }.unwrap().do_cycle();
+    unsafe { PSG.get_mut() }.unwrap().do_cycle();
 
     unsafe { VDP.get_mut() }
         .unwrap()
@@ -186,23 +188,22 @@ pub struct Options {
 pub fn run(cart: Cart, options: Options) {
     init_logger(options.log_level).unwrap();
 
-    let (md_sound, z80) = Z80::new();
+    let md_audio = MdAudio::new();
 
     unsafe {
         VDP.set(Vdp::new()).ok().unwrap();
-        Z80.set(z80).ok().unwrap();
-        CPU.set(MusashiCpu::new(
-            &cart.rom_data,
-            Controller::default(),
-            Controller::default(),
-        ).unwrap())
+        Z80.set(Z80::new(md_audio.clone())).ok().unwrap();
+        PSG.set(Psg::new(md_audio.clone())).ok().unwrap();
+        CPU.set(
+            MusashiCpu::new(&cart.rom_data, Controller::default(), Controller::default()).unwrap(),
+        )
         .ok()
         .unwrap();
     };
 
     let hit_breakpoint = false;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
-    let mut sdl_system = init_sdl(md_sound);
+    let mut sdl_system = init_sdl(md_audio);
 
     cpu::do_log(options.trace_instructions);
 

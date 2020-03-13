@@ -161,7 +161,11 @@ static CPU_EXISTS: AtomicBool = AtomicBool::new(false);
 pub struct MusashiCpu {}
 
 impl MusashiCpu {
-    pub fn new(rom_data: &[u8], controller_1: Controller, controller_2: Controller) -> Result<MusashiCpu, ()> {
+    pub fn new(
+        rom_data: &[u8],
+        controller_1: Controller,
+        controller_2: Controller,
+    ) -> Result<MusashiCpu, ()> {
         // If the CPU already existed, then we can't create another
         if CPU_EXISTS.swap(true, Ordering::SeqCst) {
             return Err(());

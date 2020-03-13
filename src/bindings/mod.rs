@@ -1,5 +1,6 @@
 pub mod cpu;
 mod inner;
+pub mod psg;
 pub mod ym3438;
 
 use crate::controller::Controller;
@@ -9,10 +10,12 @@ use crate::vdp::Vdp;
 use crate::z80::Z80;
 use log::{info, warn};
 use once_cell::sync::OnceCell;
+use psg::Psg;
 
 pub static mut SYSTEM_STATE: OnceCell<SystemState> = OnceCell::new();
 pub static mut VDP: OnceCell<Vdp> = OnceCell::new();
 pub static mut Z80: OnceCell<Z80> = OnceCell::new();
+pub static mut PSG: OnceCell<Psg> = OnceCell::new();
 
 pub struct SystemState {
     pub rom: Box<[u8]>,
@@ -97,13 +100,34 @@ impl AddressSpace for SystemState {
         );
 
         match addr {
-            0xA1_0003..=0xA1_0004 => {
+            0xA0_0000..=0xA0_FFFF => {
+                // TODO: Check if Z80 needs to be stopped
+                assert_eq!(size, Size::Byte);
+                unsafe {
+                    Z80.get_mut()
+                        .unwrap()
+                        .write_ext(addr as u16, value as u8, self)
+                }
+                return;
+            }
+            0xA1_0002..=0xA1_0003 => {
+                assert_eq!(size, Size::Byte);
                 self.controller_1.write_reg1(value as u8);
                 return;
             }
-            0xA1_0009..=0xA1_000A => {
+            0xA1_0004..=0xA1_0005 => {
+                assert_eq!(size, Size::Byte);
+                self.controller_2.write_reg1(value as u8);
+                return;
+            }
+            0xA1_0008..=0xA1_0009 => {
                 assert_eq!(size, Size::Byte);
                 self.controller_1.write_reg2(value as u8);
+                return;
+            }
+            0xA1_000A..=0xA1_000B => {
+                assert_eq!(size, Size::Byte);
+                self.controller_2.write_reg2(value as u8);
                 return;
             }
             0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
@@ -126,8 +150,9 @@ impl AddressSpace for SystemState {
                 return;
             }
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
-                // TODO:
-                warn!("Ignoring write to PSG output");
+                // TODO: is this correct?
+                assert_eq!(size, Size::Byte);
+                unsafe { PSG.get_mut() }.unwrap().write(value as u8);
                 return;
             }
             0xA1_0020..=0xA1_10FF => {
