@@ -7,23 +7,15 @@ mod vdp;
 mod z80;
 
 use bindings::cpu::MusashiCpu;
-use bindings::psg::Psg;
-use bindings::{PSG, SYSTEM_STATE, VDP, Z80};
 use cart::Cart;
-use controller::Controller;
 use log::info;
 pub use log::LevelFilter;
-use once_cell::sync::OnceCell;
 use sdl2::audio::AudioSpecDesired;
 use sdl_system::SDLSystem;
 use std::collections::BinaryHeap;
 use std::time::Instant;
-use vdp::Vdp;
-use z80::{MdAudio, Z80};
-
-//const Z80_DATA: &[u8; 7110] = include_bytes!("../../z80decompressed.bin");
-
-static mut CPU: OnceCell<MusashiCpu> = OnceCell::new();
+use z80::MdAudio;
+use bindings::context::Context;
 
 fn get_four_bytes(data: &[u8]) -> [u8; 4] {
     let mut result = [0; 4];
@@ -71,16 +63,10 @@ fn on_breakpoint(sdl_system: &mut SDLSystem) {
     }
 }
 
-fn on_scanline(sdl_system: &mut SDLSystem) -> bool {
+fn on_scanline(context: &mut Context, sdl_system: &mut SDLSystem) -> bool {
     let events: Vec<_> = sdl_system.event_pump.poll_iter().collect();
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .controller_1
-        .update_buttons(&events);
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .controller_2
-        .update_buttons(&events);
+    context.controller_1.update_buttons(&events);
+    context.controller_2.update_buttons(&events);
     for event in events {
         match event {
             sdl2::event::Event::KeyDown {
@@ -145,24 +131,18 @@ fn init_sdl(md_sound: z80::MdAudio, silent: bool) -> SDLSystem {
     sdl_system
 }
 
-fn update(pending: &mut BinaryHeap<Interrupt>, sdl_system: &mut SDLSystem) -> (bool, bool) {
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .controller_1
-        .update();
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .controller_2
-        .update();
-    unsafe { CPU.get_mut() }.unwrap().do_cycle(pending);
-    unsafe { Z80.get_mut() }.unwrap().do_cycle();
-    unsafe { PSG.get_mut() }.unwrap().do_cycle();
-
-    unsafe { VDP.get_mut() }
-        .unwrap()
-        .do_cycle(sdl_system, pending)
+fn update(context: &mut Context, pending: &mut BinaryHeap<Interrupt>, sdl_system: &mut SDLSystem) -> (bool, bool) {
+    context.controller_1.update();
+    context.controller_2.update();
+    let (l, mut r) = context.cpu_view();
+    l.do_cycle(pending, &mut r);
+    let (l, r) = context.z80_view();
+    l.do_cycle(r);
+    context.psg.do_cycle();
+    context.vdp.do_cycle(sdl_system, pending)
 }
 
+#[cfg(not(miri))]
 fn init_logger(level: LevelFilter) -> Result<(), fern::InitError> {
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -176,11 +156,30 @@ fn init_logger(level: LevelFilter) -> Result<(), fern::InitError> {
         })
         .level(level)
         .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
         .apply()?;
 
     Ok(())
 }
+
+#[cfg(miri)]
+fn init_logger(level: LevelFilter) -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}] {}",
+                record.target(),
+                record.level(),
+                message,
+            ))
+        })
+        .level(level)
+        .chain(std::io::stdout())
+        .apply()?;
+
+    Ok(())
+}
+
+
 
 pub struct Options {
     pub trace_instructions: bool,
@@ -192,18 +191,11 @@ pub struct Options {
 pub fn run(cart: Cart, options: Options) {
     init_logger(options.log_level).unwrap();
 
+    log::warn!("TESTTESTTEST");
+
     let md_audio = MdAudio::new();
 
-    unsafe {
-        VDP.set(Vdp::new(options.vdp_debug)).ok().unwrap();
-        Z80.set(Z80::new(md_audio.clone())).ok().unwrap();
-        PSG.set(Psg::new(md_audio.clone())).ok().unwrap();
-        CPU.set(
-            MusashiCpu::new(&cart.rom_data, Controller::default(), Controller::default()).unwrap(),
-        )
-        .ok()
-        .unwrap();
-    };
+    let mut context = Context::new(cart.rom_data, md_audio.clone(), options.vdp_debug).unwrap();
 
     let hit_breakpoint = false;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
@@ -223,9 +215,9 @@ pub fn run(cart: Cart, options: Options) {
             on_breakpoint(&mut sdl_system);
         }
 
-        let (scan_finish, frame_finish) = update(&mut pending, &mut sdl_system);
+        let (scan_finish, frame_finish) = update(&mut context, &mut pending, &mut sdl_system);
 
-        if scan_finish && on_scanline(&mut sdl_system) {
+        if scan_finish && on_scanline(&mut context, &mut sdl_system) {
             break 'running;
         }
 

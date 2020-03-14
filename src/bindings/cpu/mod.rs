@@ -1,11 +1,10 @@
+mod state_pair;
 use super::inner::{
-    m68k_disassemble, m68k_execute, m68k_get_reg, m68k_init, m68k_pulse_reset, m68k_register_t,
+    m68k_disassemble, m68k_execute, m68k_end_timeslice, m68k_cycles_run, m68k_get_reg, m68k_init, m68k_pulse_reset, m68k_register_t,
     m68k_register_t_M68K_REG_D0, m68k_set_cpu_type, m68k_set_instr_hook_callback, m68k_set_irq,
     M68K_CPU_TYPE_68000,
 };
-use super::{SystemState, SYSTEM_STATE};
-use crate::controller::Controller;
-use crate::cpu::address_space::AddressSpace;
+use super::context::{CpuView, CpuViewRaw};
 use crate::cpu::instruction::Size;
 use crate::Interrupt;
 use log::trace;
@@ -13,17 +12,42 @@ use std::collections::BinaryHeap;
 use std::ffi::CStr;
 use std::os::raw::c_uint;
 use std::sync::atomic::{AtomicBool, Ordering};
+use crate::cpu::address_space::AddressSpace;
+use state_pair::*;
+
 
 fn read_memory(address: c_uint, size: Size) -> c_uint {
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .read(address, size)
+    unsafe { TEMP_DATA.read(address, size) }
 }
 
 fn write_memory(address: c_uint, size: Size, value: c_uint) {
-    unsafe { SYSTEM_STATE.get_mut() }
-        .unwrap()
-        .write(address, value, size);
+    unsafe { TEMP_DATA.write(address, value, size) }
+}
+
+// TODO: Optimize
+#[no_mangle]
+extern "C" fn m68k_read_immediate_16(address: c_uint) -> c_uint {
+    unsafe { TEMP_DATA.read_immediate(address, false) }
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_immediate_32(address: c_uint) -> c_uint {
+    unsafe { TEMP_DATA.read_immediate(address, true) }
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_pcrelative_8(address: c_uint) -> c_uint {
+    m68k_read_memory_8(address)
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_pcrelative_16(address: c_uint) -> c_uint {
+    m68k_read_memory_16(address)
+}
+
+#[no_mangle]
+extern "C" fn m68k_read_pcrelative_32(address: c_uint) -> c_uint {
+    m68k_read_memory_32(address)
 }
 
 #[no_mangle]
@@ -158,51 +182,38 @@ impl Register {
 // And also it just won't make sense
 static CPU_EXISTS: AtomicBool = AtomicBool::new(false);
 
-pub struct MusashiCpu {}
+pub struct MusashiCpu { _deny: (), }
 
 impl MusashiCpu {
-    pub fn new(
-        rom_data: &[u8],
-        controller_1: Controller,
-        controller_2: Controller,
-    ) -> Result<MusashiCpu, ()> {
-        // If the CPU already existed, then we can't create another
+    pub unsafe fn partial_new() -> Result<MusashiCpu, ()> {
+         // If the CPU already existed, then we can't create another
         if CPU_EXISTS.swap(true, Ordering::SeqCst) {
             return Err(());
         }
 
-        let cart_ram = {
-            let mut cart_ram = Vec::new();
-            cart_ram.resize(0x40_0000 - rom_data.len(), 0);
-            Box::from(&cart_ram[..])
-        };
-
-        unsafe {
-            SYSTEM_STATE
-                .set(SystemState {
-                    rom: rom_data.into(),
-                    controller_1,
-                    controller_2,
-                    ram: [0; 0x1_0000][..].into(),
-                    cart_ram,
-                })
-                .ok()
-                .unwrap()
-        };
-
-        unsafe {
-            m68k_init();
-            m68k_set_cpu_type(M68K_CPU_TYPE_68000);
-            m68k_set_instr_hook_callback(Some(on_instruction));
-            m68k_pulse_reset();
-        };
-
-        Ok(MusashiCpu {})
+        m68k_init();
+        m68k_set_cpu_type(M68K_CPU_TYPE_68000);
+        m68k_set_instr_hook_callback(Some(on_instruction));
+        
+        Ok(MusashiCpu{ _deny: () })
     }
 
-    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+    #[allow(dead_code)]
+    pub fn new(context: CpuView) -> Result<MusashiCpu, ()> {
+        let mut m = unsafe { Self::partial_new()? };
+        m.pulse_reset(context);
+        Ok(m)
+    }
+
+    /// When the CPU is executing, it should have exclusive access to the other
+    /// components of the system
+    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
         unsafe {
-            m68k_execute(1);
+            TEMP_DATA = StatePair(self as *mut _, context.as_raw());
+        };
+
+        unsafe {
+            m68k_execute(100);
         };
 
         if let Some(int) = pending.peek() {
@@ -213,10 +224,49 @@ impl MusashiCpu {
                 pending.pop();
             }
         }
+
+        // Don't wanna be keeping those pointers around
+        unsafe {
+            TEMP_DATA = StatePair(std::ptr::null_mut(), CpuViewRaw::new());
+        }
     }
 
     pub fn get_reg(&self, reg: Register) -> u32 {
         unsafe { m68k_get_reg(std::ptr::null_mut(), reg as m68k_register_t) }
+    }
+
+    pub fn pulse_reset(&mut self, mut context: CpuView) {
+        unsafe {
+            TEMP_DATA = StatePair(self as *mut _, context.as_raw());
+            m68k_pulse_reset();
+            TEMP_DATA = StatePair(std::ptr::null_mut(), CpuViewRaw::new());
+        }
+    }
+
+    pub fn end_timeslice(&mut self, context: &mut CpuView) {
+        let cycles = unsafe { m68k_cycles_run() };
+        unsafe { m68k_end_timeslice() };
+
+        for _ in 0..cycles {
+            context.controller_1.update();
+            context.controller_2.update();
+
+            let view = super::context::Z80View {
+                cpu: self,
+                vdp: context.vdp,
+                psg: context.psg,
+                controller_1: context.controller_1,
+                controller_2: context.controller_2,
+                cart_ram: context.cart_ram,
+                ram: context.ram,
+                rom: context.rom,
+            };
+            context.z80.do_cycle(view);
+
+            context.psg.do_cycle();
+            // TODO: GET INTERRUPTS AND RENDERING FROM THIS
+            context.vdp.do_cycle2();
+        }
     }
 }
 

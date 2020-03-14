@@ -642,6 +642,64 @@ impl VdpInner {
         sdl_system.canvas().present();
     }
 
+    pub fn do_cycle2(&mut self) -> (bool, bool) {
+        self.cycle += 1;
+
+        // TODO: It should be 488.5 I think,
+        // and the CPU definitely does *not* take only one cycle to execute each instruction
+        //
+        // TODO: But it only has a 342 pixel range!
+        let result_1 = if self.cycle % 488 == 0 {
+            // One scanline has finished
+            self.scanline += 1;
+            if self.horiz_int_counter == 0 {
+                self.horiz_int_counter = self.horiz_int_period;
+            } else {
+                self.horiz_int_counter -= 1;
+            }
+
+            true
+        } else {
+            false
+        };
+
+        /*      Horizontal Size
+           13 left border + 14 right border
+
+        */
+
+        // TODO: Support PAL
+        /*      Vertical Size
+            PAL         |   NTSC
+        38 border       | 11 border
+        224 picture     | 224 picture
+        32 border       | 8 border
+        3 + 3 + 3 sync  | 3 + 3 + 3 sync
+        10 blank        | 10 blank
+        313 TOTAL       | 262 TOTAL
+         */
+
+        /*if 11 <= self.scanline && self.scanline < 224 + 11
+            && 13 <= self.get_pixel() && self.get_pixel() < 13 + self.mode4.width() as u16 {
+            let row = self.scanline as u16 - 11;
+            let col = self.get_pixel() as u16 - 13;
+            self.render_plane_pixel(sdl_system, row, col);
+        }*/
+
+        let result_2 = if self.scanline == 262 {
+            // One frame has finished
+            self.scanline = 0;
+
+            warn!("Would have rendered");
+
+            true
+        } else {
+            false
+        };
+
+        (result_1, result_2)
+    }
+
     // 262 line range
     // 342 pixel range
     pub fn do_cycle(

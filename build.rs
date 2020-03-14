@@ -14,6 +14,8 @@ fn main() {
         .blacklist_function("m68k_read_memory_(8|16|32)")
         .blacklist_function("m68k_read_disassembler_(8|16|32)")
         .blacklist_function("m68k_write_memory_(8|16|32)")
+        .blacklist_function("m68k_read_immediate_(16|32)")
+        .blacklist_function("m68k_read_pcrelative_(8|16|32)")
         // but why tho
         .blacklist_function("SNG_readIO")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))

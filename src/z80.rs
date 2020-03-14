@@ -1,4 +1,5 @@
 use crate::bindings::ym3438::Ym3438;
+use crate::bindings::context::Z80View;
 use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
 use sdl2::audio::AudioCallback;
@@ -58,16 +59,18 @@ impl AudioCallback for MdAudio {
  *
  */
 
-struct Z80Control {
+struct Z80ControlInner {
     ram: [u8; 0x2000],
     ym_chip: RefCell<Ym3438>,
     bank_address: u32,
     bank_address_bit: u32,
 }
 
-impl Z80Control {
-    pub fn new() -> Z80Control {
-        Z80Control {
+struct Z80Control<'a, 'b>(&'a mut Z80ControlInner, RefCell<Z80View<'b>>);
+
+impl Z80ControlInner {
+    pub fn new() -> Z80ControlInner {
+        Z80ControlInner {
             ram: [0; 0x2000],
             ym_chip: RefCell::new(Ym3438::new()),
             bank_address: 0,
@@ -76,54 +79,49 @@ impl Z80Control {
     }
 }
 
-impl Memory for Z80Control {
+impl Memory for Z80Control<'_, '_> {
     type Timestamp = u64;
 
     fn read_debug(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x1FFF => self.ram[address as usize],
-            0x2000..=0x3FFF => self.ram[address as usize - 0x2000],
-            0x4000..=0x4003 => self.ym_chip.borrow_mut().read(address as u32 - 0x4000),
+            0x0000..=0x1FFF => self.0.ram[address as usize],
+            0x2000..=0x3FFF => self.0.ram[address as usize - 0x2000],
+            0x4000..=0x4003 => self.0.ym_chip.borrow_mut().read(address as u32 - 0x4000),
             0x4004..=0x5FFF => panic!("Reserved memory"),
             0x6000..=0x6000 => 0xFF, // Read from bank register
             0x6001..=0x7F10 => panic!("Reserved memory"),
-            0x7F11..=0x7F11 => unsafe { crate::bindings::PSG.get_mut() }.unwrap().read(),
+            0x7F11..=0x7F11 => self.1.borrow_mut().psg.read(),
             0x7F12..=0x7FFF => todo!("VDP"),
-            0x8000..=0xFFFF => unsafe { crate::bindings::SYSTEM_STATE.get_mut() }
-                .unwrap()
-                .read((self.bank_address << 15) | address as u32, Size::Byte)
-                as u8,
+            0x8000..=0xFFFF => self.1.borrow_mut().read((self.0.bank_address << 15) | address as u32, Size::Byte) as u8,
         }
     }
 
     fn write_mem(&mut self, address: u16, value: u8, _ts: Self::Timestamp) {
         match address {
-            0x0000..=0x1FFF => self.ram[address as usize] = value,
-            0x2000..=0x3FFF => self.ram[address as usize - 0x2000] = value,
-            0x4000..=0x4003 => self.ym_chip.get_mut().write(address as u32 - 0x4000, value),
+            0x0000..=0x1FFF => self.0.ram[address as usize] = value,
+            0x2000..=0x3FFF => self.0.ram[address as usize - 0x2000] = value,
+            0x4000..=0x4003 => self.0.ym_chip.get_mut().write(address as u32 - 0x4000, value),
             0x4004..=0x5FFF => panic!("Reserved memory"),
             0x6000..=0x6000 => {
-                let mask = 1 << (self.bank_address_bit + 15);
-                self.bank_address_bit += 1;
-                self.bank_address_bit %= 9;
+                let mask = 1 << (self.0.bank_address_bit + 15);
+                self.0.bank_address_bit += 1;
+                self.0.bank_address_bit %= 9;
 
                 if value as u32 & 0x1 != 0 {
-                    self.bank_address |= mask;
+                    self.0.bank_address |= mask;
                 } else {
-                    self.bank_address &= !mask;
+                    self.0.bank_address &= !mask;
                 }
             }
             0x6001..=0x7F10 => panic!("Reserved memory"),
-            0x7F11..=0x7F11 => unsafe { crate::bindings::PSG.get_mut() }
-                .unwrap()
-                .write(value),
+            0x7F11..=0x7F11 => self.1.borrow_mut().psg.write(value),
             0x7F12..=0x7FFF => todo!("What is this?"),
             0x8000..=0xFFFF => todo!("Bank area"),
         }
     }
 }
 
-impl Io for Z80Control {
+impl Io for Z80Control<'_, '_> {
     type Timestamp = u64;
     type WrIoBreak = ();
     type RetiBreak = ();
@@ -179,7 +177,7 @@ impl Clock for Z80Clock {
 }
 
 pub struct Z80 {
-    control: Z80Control,
+    control: Z80ControlInner,
     clock: Z80Clock,
     cpu: Z80NMOS,
     pub stopped: bool,
@@ -192,7 +190,7 @@ impl Z80 {
         let mut cpu = Z80NMOS::new();
         cpu.reset();
         Z80 {
-            control: Z80Control::new(),
+            control: Z80ControlInner::new(),
             clock: Z80Clock::new(),
             cpu: Default::default(),
             stopped: true,
@@ -239,14 +237,14 @@ impl Z80 {
         &mut self.control.ram
     }
 
-    pub fn do_cycle(&mut self) {
+    pub fn do_cycle(&mut self, view: Z80View<'_>) {
         self.cycle_count += 1;
         self.cycle_count %= 6;
 
         if !self.stopped && self.cycle_count % 2 == 0 {
             let dbg = |_| {};
             self.cpu
-                .execute_next(&mut self.control, &mut self.clock, Some(dbg))
+                .execute_next(&mut Z80Control(&mut self.control, RefCell::new(view)), &mut self.clock, Some(dbg))
                 .unwrap();
         }
 
