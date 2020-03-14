@@ -27,12 +27,12 @@ fn write_memory(address: c_uint, size: Size, value: c_uint) {
 // TODO: Optimize
 #[no_mangle]
 extern "C" fn m68k_read_immediate_16(address: c_uint) -> c_uint {
-    unsafe { TEMP_DATA.read_immediate(address, false) }
+    unsafe { TEMP_DATA.read_immediate_16(address) }
 }
 
 #[no_mangle]
 extern "C" fn m68k_read_immediate_32(address: c_uint) -> c_uint {
-    unsafe { TEMP_DATA.read_immediate(address, true) }
+    unsafe { TEMP_DATA.read_immediate_32(address) }
 }
 
 #[no_mangle]

@@ -8,7 +8,7 @@ use log::{info, warn};
 pub struct StatePair(pub *mut MusashiCpu, pub CpuViewRaw);
 
 impl StatePair {
-    pub fn read_immediate(&mut self, address: u32, is_long: bool) -> u32 {
+    pub fn read_immediate_16(&mut self, address: u32) -> u32 {
         let addr = (address & 0xFF_FF_FF) as usize;
 
         let rom_len = unsafe { (*self.1.rom).len() };
@@ -20,11 +20,22 @@ impl StatePair {
             _ => panic!("Invalid immediate address"),
         } };
 
-        if is_long {
-            u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32
-        } else {
-            u16::from_be_bytes([loc[0], loc[1]]) as u32
-        }
+        u16::from_be_bytes([loc[0], loc[1]]) as u32
+    }
+
+    pub fn read_immediate_32(&mut self, address: u32) -> u32 {
+        let addr = (address & 0xFF_FF_FF) as usize;
+
+        let rom_len = unsafe { (*self.1.rom).len() };
+
+        let loc = unsafe { match addr {
+            0..=0x3F_FFFF if addr < rom_len => &(*self.1.rom)[addr..],
+            0..=0x3F_FFFF => &(*self.1.cart_ram)[addr - rom_len..],
+            0xFF_0000..=0xFF_FFFF => &(*self.1.ram)[addr - 0xFF_0000..],
+            _ => panic!("Invalid immediate address"),
+        } };
+
+        u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32
     }
 }
 
