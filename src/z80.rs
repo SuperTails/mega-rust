@@ -1,4 +1,3 @@
-use crate::bindings::ym3438::Ym3438;
 use crate::bindings::context::Z80View;
 use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
@@ -7,32 +6,54 @@ use std::cell::RefCell;
 use std::num::{NonZeroU16, NonZeroU8};
 use std::sync::{Arc, Mutex};
 use z80emu::{host::cycles, Clock, Cpu, Io, Memory, Z80NMOS};
+use nuked_opn2_sys::Ym3438;
+use emu76489_sys::Psg;
 
 #[derive(Clone)]
-pub struct MdAudio(Arc<Mutex<([f32; 2048], usize, usize)>>);
+pub struct MdAudioData(Arc<Mutex<([f32; 2048], usize, usize)>>);
+
+#[derive(Clone)]
+pub struct MdAudio{
+    // Measured in Z80 cycles
+    pub cycle: u64,
+    pub data: MdAudioData,
+}
 
 impl MdAudio {
     pub fn new() -> MdAudio {
-        MdAudio(Arc::new(Mutex::new(([0.0; 2048], 0, 0))))
+        MdAudio {
+            cycle: 0,
+            data: MdAudioData::new()
+        }
     }
 
-    pub fn add_ym_sample(&self, _value: f32) {
-        // TODO: Add them together
-        /*let locked = self.0.lock().unwrap();
-        locked.0[locked.1] = value;
-        locked.1 += 1;*/
+    // Returns true if it is time to add a sample
+    pub fn do_cycle(&mut self) -> bool {
+        self.cycle += 1;
+        self.cycle % 87 == 0
     }
 
-    pub fn add_psg_sample(&self, value: f32) {
-        let mut locked = self.0.lock().unwrap();
+    pub fn add_sample(&self, psg: &mut Psg, ym: &mut Ym3438) {
+        let mut locked = self.data.0.lock().unwrap();
         let idx = locked.2;
+
+        let c = ym.clock();
+
         // TODO: Adjust volume properly
+        let value = psg.calc() as f32 / 1000.0 + (c.0 as f32 + c.1 as f32) / 1000.0;
+
         locked.0[idx] = value / 1000.0;
         locked.2 = (locked.2 + 1) % 2048;
     }
 }
 
-impl AudioCallback for MdAudio {
+impl MdAudioData {
+    pub fn new() -> MdAudioData {
+        MdAudioData(Arc::new(Mutex::new(([0.0; 2048], 0, 0))))
+    }
+}
+
+impl AudioCallback for MdAudioData {
     type Channel = f32;
 
     fn callback(&mut self, data: &mut [Self::Channel]) {
@@ -90,9 +111,13 @@ impl Memory for Z80Control<'_, '_> {
             0x4004..=0x5FFF => panic!("Reserved memory"),
             0x6000..=0x6000 => 0xFF, // Read from bank register
             0x6001..=0x7F10 => panic!("Reserved memory"),
-            0x7F11..=0x7F11 => self.1.borrow_mut().psg.read(),
+            0x7F11..=0x7F11 => self.1.borrow_mut().psg.read_io(),
             0x7F12..=0x7FFF => todo!("VDP"),
-            0x8000..=0xFFFF => self.1.borrow_mut().read((self.0.bank_address << 15) | address as u32, Size::Byte) as u8,
+            0x8000..=0xFFFF => self
+                .1
+                .borrow_mut()
+                .read((self.0.bank_address << 15) | address as u32, Size::Byte)
+                as u8,
         }
     }
 
@@ -100,7 +125,11 @@ impl Memory for Z80Control<'_, '_> {
         match address {
             0x0000..=0x1FFF => self.0.ram[address as usize] = value,
             0x2000..=0x3FFF => self.0.ram[address as usize - 0x2000] = value,
-            0x4000..=0x4003 => self.0.ym_chip.get_mut().write(address as u32 - 0x4000, value),
+            0x4000..=0x4003 => self
+                .0
+                .ym_chip
+                .get_mut()
+                .write(address as u32 - 0x4000, value),
             0x4004..=0x5FFF => panic!("Reserved memory"),
             0x6000..=0x6000 => {
                 let mask = 1 << (self.0.bank_address_bit + 15);
@@ -114,7 +143,7 @@ impl Memory for Z80Control<'_, '_> {
                 }
             }
             0x6001..=0x7F10 => panic!("Reserved memory"),
-            0x7F11..=0x7F11 => self.1.borrow_mut().psg.write(value),
+            0x7F11..=0x7F11 => self.1.borrow_mut().psg.write_io(value),
             0x7F12..=0x7FFF => todo!("What is this?"),
             0x8000..=0xFFFF => todo!("Bank area"),
         }
@@ -241,18 +270,21 @@ impl Z80 {
         self.cycle_count += 1;
         self.cycle_count %= 6;
 
+        if self.audio_data.do_cycle() {
+            self.audio_data.add_sample(view.psg, self.control.ym_chip.get_mut());
+        } else if self.cycle_count == 0 {
+            self.control.ym_chip.get_mut().clock();
+        }
+
         if !self.stopped && self.cycle_count % 2 == 0 {
             let dbg = |_| {};
             self.cpu
-                .execute_next(&mut Z80Control(&mut self.control, RefCell::new(view)), &mut self.clock, Some(dbg))
+                .execute_next(
+                    &mut Z80Control(&mut self.control, RefCell::new(view)),
+                    &mut self.clock,
+                    Some(dbg),
+                )
                 .unwrap();
-        }
-
-        if self.cycle_count == 0 {
-            let o = self.control.ym_chip.get_mut().clock();
-            let o2 = (o.0 as f32 + o.1 as f32) / 1_000.0;
-
-            self.audio_data.add_ym_sample(o2);
         }
     }
 }

@@ -6,6 +6,7 @@ mod sdl_system;
 mod vdp;
 mod z80;
 
+use bindings::context::Context;
 use bindings::cpu::MusashiCpu;
 use cart::Cart;
 use log::info;
@@ -15,7 +16,6 @@ use sdl_system::SDLSystem;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 use z80::MdAudio;
-use bindings::context::Context;
 
 fn get_four_bytes(data: &[u8]) -> [u8; 4] {
     let mut result = [0; 4];
@@ -108,7 +108,7 @@ fn on_frame(frames: &mut Vec<Instant>, i: &mut u32, last_i: &mut u32) {
     *last_i = *i;
 }
 
-fn init_sdl(md_sound: z80::MdAudio, silent: bool) -> SDLSystem {
+fn init_sdl(md_sound: z80::MdAudioData, silent: bool) -> SDLSystem {
     let mut sdl_system = SDLSystem::new();
     sdl_system.canvas.set_scale(2.0, 2.0).unwrap();
 
@@ -129,17 +129,6 @@ fn init_sdl(md_sound: z80::MdAudio, silent: bool) -> SDLSystem {
     }
 
     sdl_system
-}
-
-fn update(context: &mut Context, pending: &mut BinaryHeap<Interrupt>, sdl_system: &mut SDLSystem) -> (bool, bool) {
-    context.controller_1.update();
-    context.controller_2.update();
-    let (l, mut r) = context.cpu_view();
-    l.do_cycle(pending, &mut r);
-    let (l, r) = context.z80_view();
-    l.do_cycle(r);
-    context.psg.do_cycle();
-    context.vdp.do_cycle(sdl_system, pending)
 }
 
 #[cfg(not(miri))]
@@ -179,8 +168,6 @@ fn init_logger(level: LevelFilter) -> Result<(), fern::InitError> {
     Ok(())
 }
 
-
-
 pub struct Options {
     pub trace_instructions: bool,
     pub log_level: LevelFilter,
@@ -199,7 +186,7 @@ pub fn run(cart: Cart, options: Options) {
 
     let hit_breakpoint = false;
     let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
-    let mut sdl_system = init_sdl(md_audio, options.silent);
+    let mut sdl_system = init_sdl(md_audio.data, options.silent);
 
     cpu::do_log(options.trace_instructions);
 
@@ -215,7 +202,7 @@ pub fn run(cart: Cart, options: Options) {
             on_breakpoint(&mut sdl_system);
         }
 
-        let (scan_finish, frame_finish) = update(&mut context, &mut pending, &mut sdl_system);
+        let (scan_finish, frame_finish) = context.update(&mut pending, &mut sdl_system);
 
         if scan_finish && on_scanline(&mut context, &mut sdl_system) {
             break 'running;

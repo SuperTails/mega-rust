@@ -22,7 +22,8 @@ z80emu = "0.1"
 log = "0.4.8"
 fern = "0.5"
 chrono = "0.4.11"
+emu76489-sys = { path = "../emu76489-sys" }
+nuked-opn2-sys = { path = "../nuked-opn2-sys" }
 
 [build-dependencies]
 bindgen = "0.53.1"
-cc = "1.0"

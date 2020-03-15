@@ -1,9 +1,9 @@
-use std::ptr::null_mut;
-use super::MusashiCpu;
 use super::super::context::CpuViewRaw;
+use super::MusashiCpu;
 use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
 use log::{info, warn};
+use std::ptr::null_mut;
 
 pub struct StatePair(pub *mut MusashiCpu, pub CpuViewRaw);
 
@@ -13,12 +13,14 @@ impl StatePair {
 
         let rom_len = unsafe { (*self.1.rom).len() };
 
-        let loc = unsafe { match addr {
-            0..=0x3F_FFFF if addr < rom_len => &(*self.1.rom)[addr..],
-            0..=0x3F_FFFF => &(*self.1.cart_ram)[addr - rom_len..],
-            0xFF_0000..=0xFF_FFFF => &(*self.1.ram)[addr - 0xFF_0000..],
-            _ => panic!("Invalid immediate address"),
-        } };
+        let loc = unsafe {
+            match addr {
+                0..=0x3F_FFFF if addr < rom_len => &(*self.1.rom)[addr..],
+                0..=0x3F_FFFF => &(*self.1.cart_ram)[addr - rom_len..],
+                0xFF_0000..=0xFF_FFFF => &(*self.1.ram)[addr - 0xFF_0000..],
+                _ => panic!("Invalid immediate address"),
+            }
+        };
 
         u16::from_be_bytes([loc[0], loc[1]]) as u32
     }
@@ -28,12 +30,14 @@ impl StatePair {
 
         let rom_len = unsafe { (*self.1.rom).len() };
 
-        let loc = unsafe { match addr {
-            0..=0x3F_FFFF if addr < rom_len => &(*self.1.rom)[addr..],
-            0..=0x3F_FFFF => &(*self.1.cart_ram)[addr - rom_len..],
-            0xFF_0000..=0xFF_FFFF => &(*self.1.ram)[addr - 0xFF_0000..],
-            _ => panic!("Invalid immediate address"),
-        } };
+        let loc = unsafe {
+            match addr {
+                0..=0x3F_FFFF if addr < rom_len => &(*self.1.rom)[addr..],
+                0..=0x3F_FFFF => &(*self.1.cart_ram)[addr - rom_len..],
+                0xFF_0000..=0xFF_FFFF => &(*self.1.ram)[addr - 0xFF_0000..],
+                _ => panic!("Invalid immediate address"),
+            }
+        };
 
         u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32
     }
@@ -103,7 +107,7 @@ impl AddressSpace for StatePair {
             Size::Word => u16::from_be_bytes([loc[0], loc[1]]) as u32,
             Size::Long => u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32,
         }
-    }   
+    }
 
     fn write(&mut self, address: u32, value: u32, size: Size) {
         let cpu = unsafe { &mut *self.0 };
@@ -180,7 +184,7 @@ impl AddressSpace for StatePair {
                 // TODO: is this correct?
                 cpu.end_timeslice(&mut context);
                 assert_eq!(size, Size::Byte);
-                context.psg.write(value as u8);
+                context.psg.write_io(value as u8);
                 return;
             }
             0xA1_0020..=0xA1_10FF => {
@@ -220,18 +224,20 @@ impl AddressSpace for StatePair {
                 warn!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };
         }
-
     }
 }
 
-/// These pointers are valid ***ONLY*** while `MusashiCpu::do_cycle` is running 
-pub static mut TEMP_DATA: StatePair = StatePair(std::ptr::null_mut(), CpuViewRaw {
-    vdp: null_mut(),
-    z80: null_mut(),
-    psg: null_mut(),
-    controller_1: null_mut(),
-    controller_2: null_mut(),
-    rom: null_mut::<[u8; 0]>() as *mut [u8],
-    cart_ram: null_mut::<[u8; 0]>() as *mut [u8],
-    ram: null_mut::<[u8; 0]>() as *mut [u8],
-});
+/// These pointers are valid ***ONLY*** while `MusashiCpu::do_cycle` is running
+pub static mut TEMP_DATA: StatePair = StatePair(
+    std::ptr::null_mut(),
+    CpuViewRaw {
+        vdp: null_mut(),
+        z80: null_mut(),
+        psg: null_mut(),
+        controller_1: null_mut(),
+        controller_2: null_mut(),
+        rom: null_mut::<[u8; 0]>() as *mut [u8],
+        cart_ram: null_mut::<[u8; 0]>() as *mut [u8],
+        ram: null_mut::<[u8; 0]>() as *mut [u8],
+    },
+);

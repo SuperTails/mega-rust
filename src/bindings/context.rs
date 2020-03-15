@@ -1,17 +1,20 @@
-use crate::bindings::psg::Psg;
 use crate::bindings::cpu::MusashiCpu;
-use crate::vdp::Vdp;
-use crate::z80::Z80;
-use crate::z80::MdAudio;
 use crate::controller::Controller;
-use crate::cpu::instruction::Size;
 use crate::cpu::address_space::AddressSpace;
+use crate::cpu::instruction::Size;
+use crate::vdp::Vdp;
+use crate::z80::MdAudio;
+use crate::z80::Z80;
+use emu76489_sys::{Psg, GENESIS_CLOCK_NTSC};
 use log::{info, warn};
+use std::collections::BinaryHeap;
+use crate::Interrupt;
+use crate::sdl_system::SDLSystem;
 
 pub struct Context {
     pub cpu: MusashiCpu,
     pub vdp: Vdp,
-    pub z80: Z80,   
+    pub z80: Z80,
     pub psg: Psg,
     pub controller_1: Controller,
     pub controller_2: Controller,
@@ -88,7 +91,7 @@ macro_rules! make_view {
 make_view! {
     pub struct CpuViewRaw;
     pub struct CpuView<'a> {
-        pub vdp: &'a mut Vdp,   
+        pub vdp: &'a mut Vdp,
         pub z80: &'a mut Z80,
         pub psg: &'a mut Psg,
         pub controller_1: &'a mut Controller,
@@ -124,8 +127,8 @@ impl Context {
         let mut m = Context {
             cpu: unsafe { MusashiCpu::partial_new()? },
             vdp: Vdp::new(vdp_debug),
-            z80: Z80::new(md_audio.clone()),
-            psg: Psg::new(md_audio),
+            z80: Z80::new(md_audio),
+            psg: Psg::new(GENESIS_CLOCK_NTSC, 44100),
             controller_1: Controller::default(),
             controller_2: Controller::default(),
             rom,
@@ -139,32 +142,47 @@ impl Context {
         Ok(m)
     }
 
+    pub fn update(&mut self, pending: &mut BinaryHeap<Interrupt>, sdl_system: &mut SDLSystem) -> (bool, bool) {
+        self.controller_1.update();
+        self.controller_2.update();
+        let (l, mut r) = self.cpu_view();
+        l.do_cycle(pending, &mut r);
+        let (l, r) = self.z80_view();
+        l.do_cycle(r);
+        // TODO: UPDATE THE PSG CYCLE COUNT SO IT MAKES SOUND
+        self.vdp.do_cycle(sdl_system, pending)
+    }
+
     pub fn cpu_view(&mut self) -> (&mut MusashiCpu, CpuView) {
-        (&mut self.cpu,
-        CpuView {
-            vdp: &mut self.vdp,
-            z80: &mut self.z80,
-            psg: &mut self.psg,
-            controller_1: &mut self.controller_1,
-            controller_2: &mut self.controller_2,
-            rom: &mut self.rom,
-            cart_ram: &mut self.cart_ram,
-            ram: &mut self.ram,
-        })
+        (
+            &mut self.cpu,
+            CpuView {
+                vdp: &mut self.vdp,
+                z80: &mut self.z80,
+                psg: &mut self.psg,
+                controller_1: &mut self.controller_1,
+                controller_2: &mut self.controller_2,
+                rom: &mut self.rom,
+                cart_ram: &mut self.cart_ram,
+                ram: &mut self.ram,
+            },
+        )
     }
 
     pub fn z80_view(&mut self) -> (&mut Z80, Z80View) {
-        (&mut self.z80,
-        Z80View {
-            cpu: &mut self.cpu,
-            vdp: &mut self.vdp,
-            psg: &mut self.psg,
-            controller_1: &mut self.controller_1,
-            controller_2: &mut self.controller_2,
-            rom: &mut self.rom,
-            cart_ram: &mut self.cart_ram,
-            ram: &mut self.ram,
-        })
+        (
+            &mut self.z80,
+            Z80View {
+                cpu: &mut self.cpu,
+                vdp: &mut self.vdp,
+                psg: &mut self.psg,
+                controller_1: &mut self.controller_1,
+                controller_2: &mut self.controller_2,
+                rom: &mut self.rom,
+                cart_ram: &mut self.cart_ram,
+                ram: &mut self.ram,
+            },
+        )
     }
 }
 
@@ -189,9 +207,7 @@ impl AddressSpace for Z80View<'_> {
                 assert_eq!(size, Size::Byte);
                 return self.controller_2.read_reg1() as u32;
             }
-            0xA1_1100..=0xA1_1101 => {
-                panic!("Z80 attempted to read itself")
-            }
+            0xA1_1100..=0xA1_1101 => panic!("Z80 attempted to read itself"),
             0xC0_0000..=0xC0_000F => {
                 return self.vdp.read(addr as u32) as u32;
             }
@@ -275,7 +291,7 @@ impl AddressSpace for Z80View<'_> {
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
                 // TODO: is this correct?
                 assert_eq!(size, Size::Byte);
-                self.psg.write(value as u8);
+                self.psg.write_io(value as u8);
                 return;
             }
             0xA1_0020..=0xA1_10FF => {
@@ -311,7 +327,5 @@ impl AddressSpace for Z80View<'_> {
                 warn!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };
         }
-
     }
 }
-

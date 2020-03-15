@@ -1,20 +1,19 @@
 mod state_pair;
-use super::inner::{
-    m68k_disassemble, m68k_execute, m68k_end_timeslice, m68k_cycles_run, m68k_get_reg, m68k_init, m68k_pulse_reset, m68k_register_t,
-    m68k_register_t_M68K_REG_D0, m68k_set_cpu_type, m68k_set_instr_hook_callback, m68k_set_irq,
-    M68K_CPU_TYPE_68000,
-};
 use super::context::{CpuView, CpuViewRaw};
+use super::inner::{
+    m68k_cycles_run, m68k_disassemble, m68k_end_timeslice, m68k_execute, m68k_get_reg, m68k_init,
+    m68k_pulse_reset, m68k_register_t, m68k_register_t_M68K_REG_D0, m68k_set_cpu_type,
+    m68k_set_instr_hook_callback, m68k_set_irq, M68K_CPU_TYPE_68000,
+};
+use crate::cpu::address_space::AddressSpace;
 use crate::cpu::instruction::Size;
 use crate::Interrupt;
 use log::trace;
+use state_pair::*;
 use std::collections::BinaryHeap;
 use std::ffi::CStr;
 use std::os::raw::c_uint;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::cpu::address_space::AddressSpace;
-use state_pair::*;
-
 
 fn read_memory(address: c_uint, size: Size) -> c_uint {
     unsafe { TEMP_DATA.read(address, size) }
@@ -182,11 +181,13 @@ impl Register {
 // And also it just won't make sense
 static CPU_EXISTS: AtomicBool = AtomicBool::new(false);
 
-pub struct MusashiCpu { _deny: (), }
+pub struct MusashiCpu {
+    _deny: (),
+}
 
 impl MusashiCpu {
     pub unsafe fn partial_new() -> Result<MusashiCpu, ()> {
-         // If the CPU already existed, then we can't create another
+        // If the CPU already existed, then we can't create another
         if CPU_EXISTS.swap(true, Ordering::SeqCst) {
             return Err(());
         }
@@ -194,8 +195,8 @@ impl MusashiCpu {
         m68k_init();
         m68k_set_cpu_type(M68K_CPU_TYPE_68000);
         m68k_set_instr_hook_callback(Some(on_instruction));
-        
-        Ok(MusashiCpu{ _deny: () })
+
+        Ok(MusashiCpu { _deny: () })
     }
 
     #[allow(dead_code)]
@@ -263,7 +264,8 @@ impl MusashiCpu {
             };
             context.z80.do_cycle(view);
 
-            context.psg.do_cycle();
+            // TODO: ADVANCE THE PSG COUNTER TO OUTPUT SOUND
+
             // TODO: GET INTERRUPTS AND RENDERING FROM THIS
             context.vdp.do_cycle2();
         }

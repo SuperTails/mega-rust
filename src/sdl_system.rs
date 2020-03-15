@@ -1,4 +1,4 @@
-use crate::z80::MdAudio;
+use crate::z80::MdAudioData;
 use sdl2::render::WindowCanvas;
 use sdl2::{audio::AudioDevice, AudioSubsystem, EventPump, Sdl, VideoSubsystem};
 
@@ -6,7 +6,7 @@ pub struct SDLSystem {
     pub ctx: Sdl,
     pub video_subsystem: VideoSubsystem,
     pub audio_subsystem: AudioSubsystem,
-    pub audio_device: Option<AudioDevice<MdAudio>>,
+    pub audio_device: Option<AudioDevice<MdAudioData>>,
     pub event_pump: EventPump,
     pub canvas: WindowCanvas,
 }

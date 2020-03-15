@@ -510,7 +510,7 @@ impl VdpInner {
             PlaneType::B => self.plane_b.pixel_color(r, c, self),
             PlaneType::A => self.plane_a.pixel_color(r, c, self),
         }
-   }
+    }
 
     fn render_plane_pixel(&mut self, r: u16, c: u16) {
         // Ordering, from front to back:
@@ -616,7 +616,7 @@ impl VdpInner {
             self.target.surface().height(),
         );
         sdl_system.canvas.copy(&tex, None, dest).unwrap();
- 
+
         if self.debug_render {
             let tex2 = creator
                 .create_texture_from_surface(self.debug_target.surface())
