@@ -7,17 +7,14 @@ pub mod instruction;
 
 pub use cpu_core::*;
 
-use crate::controller::Controller;
+use crate::bindings::context::CpuView;
 use crate::get_four_bytes;
-use crate::vdp::Vdp;
 use crate::Interrupt;
 use address_space::AddressSpace;
 use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
 use log::{info, trace, warn};
 use std::collections::BinaryHeap;
-use std::ops::Deref;
-use std::ops::DerefMut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 lazy_static! {
@@ -33,30 +30,30 @@ pub fn log_instr() -> bool {
 }
 
 pub struct Cpu {
-    pub vdp: Vdp,
-    no_vdp: CpuNoVdp,
+    pub core: CpuCore,
 }
 
 impl Cpu {
-    pub fn new(
-        rom: &[u8],
-        controller1: Controller,
-        controller2: Controller,
-        vdp_debug: bool,
-    ) -> Cpu {
+    pub fn new() -> Cpu {
         Cpu {
-            vdp: Vdp::new(vdp_debug),
-            no_vdp: CpuNoVdp::new(rom, controller1, controller2),
+            core: CpuCore::new()
         }
     }
 
-    fn do_run(&mut self, pending: &mut BinaryHeap<Interrupt>) {
-        self.handle_interrupts(pending);
+    fn with_context<'a, 'b>(&'a mut self, context: &'a mut CpuView<'b>) -> CpuAndContext<'a, 'b> {
+        CpuAndContext {
+            core: &mut self.core,
+            context,
+        }
+    }
+
+    fn do_run(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
+        self.handle_interrupts(pending, context);
 
         assert_eq!(self.core.pc % 2, 0);
 
         let pc = self.core.pc as u32;
-        let instr = self.instr_at(pc);
+        let instr = self.instr_at(pc, context);
 
         if log_instr() {
             trace!("Instr: {:?}", instr.opcode);
@@ -65,81 +62,37 @@ impl Cpu {
         let prev_sup = self.core.sr.supervisor();
 
         // TODO: Cycle counts
-        instr.execute(self);
+        instr.execute(&mut self.with_context(context));
 
         if prev_sup != self.core.sr.supervisor() {
-            std::mem::swap(&mut self.no_vdp.core.addr[7], &mut self.no_vdp.core.usp);
+            std::mem::swap(&mut self.core.addr[7], &mut self.core.usp);
         }
     }
 
     // TODO: Access Z80, VDP, expansion ports, and IO registers
-    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
         match self.core.state {
             State::Reset => {
-                self.do_reset();
+                self.do_reset(context);
             }
             State::Run => {
-                self.do_run(pending);
+                self.do_run(pending, context);
             }
         }
     }
-}
 
-impl Deref for Cpu {
-    type Target = CpuNoVdp;
 
-    fn deref(&self) -> &Self::Target {
-        &self.no_vdp
-    }
-}
-
-impl DerefMut for Cpu {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.no_vdp
-    }
-}
-
-pub struct CpuNoVdp {
-    pub core: CpuCore,
-    pub rom: Box<[u8]>,
-    pub cart_ram: Box<[u8]>,
-    pub ram: [u8; 0x1_0000],
-    pub z80_ram: [u8; 0x1_0000],
-    pub controller1: Controller,
-    pub controller2: Controller,
-}
-
-impl CpuNoVdp {
-    fn new(rom: &[u8], controller1: Controller, controller2: Controller) -> CpuNoVdp {
-        let rom: Box<[u8]> = rom.into();
-        let cart_ram = {
-            let mut cart_ram = Vec::new();
-            cart_ram.resize(0x40_0000 - rom.len(), 0);
-            Box::from(&cart_ram[..])
-        };
-
-        CpuNoVdp {
-            core: CpuCore::new(),
-            rom,
-            cart_ram,
-            ram: [0; 0x1_0000],
-            z80_ram: [0; 0x1_0000],
-            controller1,
-            controller2,
-        }
+    pub fn instr_at(&mut self, addr: u32, context: &mut CpuView) -> Instruction {
+        Instruction::new(self.with_context(context).read(addr, Size::Word) as u16)
     }
 
-    pub fn instr_at(&mut self, addr: u32) -> Instruction {
-        Instruction::new(self.read(addr, Size::Word) as u16)
-    }
-
-    fn do_reset(&mut self) {
+    fn do_reset(&mut self, context: &mut CpuView) {
         assert_eq!(self.core.pc % 4, 0);
         assert!(self.core.pc < 0x100);
 
         let offset = self.core.pc as usize;
-        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[offset..offset + 4]));
-        let sp = u32::from_be_bytes(get_four_bytes(&self.rom[0..4]));
+        let vector = u32::from_be_bytes(get_four_bytes(&context.rom[offset..offset + 4]));
+        let sp = u32::from_be_bytes(get_four_bytes(&context.rom[0..4]));
 
         info!(
             "Using vector at {:#08X}, PC will be {:#08X}",
@@ -155,22 +108,23 @@ impl CpuNoVdp {
         self.core.ccr.set_zero(true);
     }
 
-    fn on_external_int(&mut self) {
+    fn on_external_int(&mut self, _context: &mut CpuView) {
         todo!("External interrupt")
     }
 
-    fn on_horizontal_int(&mut self) {
+    fn on_horizontal_int(&mut self, context: &mut CpuView) {
         // TODO: This should use the SSP instead of A7 I think
         self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
-        self.write(self.core.addr[7], self.core.pc, Size::Long);
+        self.write(context, self.core.addr[7], self.core.pc, Size::Long);
         self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
         self.write(
+            context,
             self.core.addr[7],
             ((self.core.sr.0 as u32) << 8) | self.core.ccr.0 as u32,
             Size::Word,
         );
 
-        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x70..][..4]));
+        let vector = u32::from_be_bytes(get_four_bytes(&context.rom[0x70..][..4]));
 
         self.core.sr.set_priority(4);
         self.core.sr.set_supervisor(true);
@@ -178,18 +132,23 @@ impl CpuNoVdp {
         info!("Did horizontal interrupt");
     }
 
-    fn on_vertical_int(&mut self) {
+    fn write(&mut self, context: &mut CpuView, address: u32, value: u32, size: Size) {
+        self.with_context(context).write(address, value, size)
+    }
+
+    fn on_vertical_int(&mut self, context: &mut CpuView) {
         // TODO: This should use the SSP instead of A7 I think
         self.core.addr[7] = self.core.addr[7].wrapping_sub(4);
-        self.write(self.core.addr[7], self.core.pc, Size::Long);
+        self.write(context, self.core.addr[7], self.core.pc, Size::Long);
         self.core.addr[7] = self.core.addr[7].wrapping_sub(2);
         self.write(
+            context,
             self.core.addr[7],
             ((self.core.sr.0 as u32) << 8) | self.core.ccr.0 as u32,
             Size::Word,
         );
 
-        let vector = u32::from_be_bytes(get_four_bytes(&self.rom[0x78..][..4]));
+        let vector = u32::from_be_bytes(get_four_bytes(&context.rom[0x78..][..4]));
 
         self.core.sr.set_priority(6);
         self.core.sr.set_supervisor(true);
@@ -197,19 +156,19 @@ impl CpuNoVdp {
         info!("Did vertical interrupt");
     }
 
-    fn handle_interrupts(&mut self, pending: &mut BinaryHeap<Interrupt>) {
+    fn handle_interrupts(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
         if let Some(int) = pending.peek() {
             if *int as u8 > self.core.sr.priority() {
                 let int = pending.pop().unwrap();
                 match int {
                     Interrupt::External => {
-                        self.on_external_int();
+                        self.on_external_int(context);
                     }
                     Interrupt::Horizontal => {
-                        self.on_horizontal_int();
+                        self.on_horizontal_int(context);
                     }
                     Interrupt::Vertical => {
-                        self.on_vertical_int();
+                        self.on_vertical_int(context);
                     }
                 }
             }
@@ -217,100 +176,63 @@ impl CpuNoVdp {
     }
 }
 
-impl AddressSpace for Cpu {
-    fn read(&mut self, address: u32, size: Size) -> u32 {
-        let align = size.alignment();
-
-        let addr = address & 0xFF_FF_FF;
-        assert_eq!(
-            addr as usize & (align - 1),
-            0,
-            "Misaligned read: {:#X}",
-            addr
-        );
-
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            self.no_vdp.read(addr, size)
-        } else {
-            self.vdp.read(addr as u32) as u32
-        }
-    }
-
-    fn write(&mut self, address: u32, value: u32, size: Size) {
-        let align = size.alignment();
-
-        let addr = address & 0xFF_FF_FF;
-        assert_eq!(
-            addr as usize & (align - 1),
-            0,
-            "Misaligned write: {:#X}",
-            addr
-        );
-
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            self.no_vdp.write(addr, value, size)
-        } else {
-            self.vdp.write(addr, value, size, &mut self.no_vdp)
-        }
-    }
+pub struct CpuAndContext<'a, 'b> {
+    core: &'a mut CpuCore,
+    context: &'a mut CpuView<'b>,
 }
 
-impl AddressSpace for CpuNoVdp {
+impl AddressSpace for CpuAndContext<'_, '_> {
     fn read(&mut self, address: u32, size: Size) -> u32 {
-        let length = size.len();
         let align = size.alignment();
 
         let addr = (address & 0xFF_FF_FF) as usize;
 
         assert_eq!(addr & (align - 1), 0, "Misaligned read: {:#X}", addr);
 
-        if size == Size::Long && addr == 0xFFFF_FFFC {
-            info!("RETURNING 'init'");
-            return u32::from_be_bytes(*b"init");
+        match addr {
+            0xA1_0000..=0xA1_0001 => {
+                // TODO: Is this correct?
+                return u32::from_be_bytes(*b"UEUE") & size.mask();
+            }
+            0xA1_0002..=0xA1_0003 => {
+                assert_eq!(size, Size::Byte);
+                return self.context.controller_1.read_reg1() as u32;
+            }
+            0xA1_0004..=0xA1_0005 => {
+                assert_eq!(size, Size::Byte);
+                return self.context.controller_2.read_reg1() as u32;
+            }
+            0xA1_1100..=0xA1_1101 => panic!("Z80 attempted to read itself"),
+            0xC0_0000..=0xC0_000F => {
+                return self.context.vdp.read(addr as u32) as u32;
+            }
+            0xFFFF_FFFC => {
+                assert_eq!(size, Size::Long);
+                info!("RETURNING 'init'");
+                return u32::from_be_bytes(*b"init");
+            }
+            _ => {}
         }
 
-        if addr == 0xA1_0000 || addr == 0xA1_0001 {
-            // TODO: Is this correct?
-            return u32::from_be_bytes(*b"\0\0UE");
+        let rom_len = self.context.rom.len();
+
+        let loc = match addr {
+            0..=0x3F_FFFF if addr < rom_len => &self.context.rom[addr..],
+            0..=0x3F_FFFF => &self.context.cart_ram[addr - rom_len..],
+            // TODO:
+            0xA0_0000..=0xA0_FFFF => panic!("Z80 attempted to read itself"),
+            0xFF_0000..=0xFF_FFFF => &self.context.ram[addr - 0xFF_0000..],
+            _ => {
+                warn!("Unimplemented address {:#08X}, reading zero", addr);
+                &[0, 0, 0, 0]
+            }
+        };
+
+        match size {
+            Size::Byte => u8::from_be_bytes([loc[0]]) as u32,
+            Size::Word => u16::from_be_bytes([loc[0], loc[1]]) as u32,
+            Size::Long => u32::from_be_bytes([loc[0], loc[1], loc[2], loc[3]]) as u32,
         }
-
-        if addr == 0xA1_0003 || addr == 0xA1_0004 {
-            assert_eq!(size, Size::Byte);
-            return self.controller1.read_reg1() as u32;
-        }
-
-        if addr == 0xA1_0005 || addr == 0xA1_0006 {
-            assert_eq!(size, Size::Byte);
-            return self.controller2.read_reg1() as u32;
-        }
-
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            panic!("Attempt to access VDP from CpuNoVdp!")
-        }
-
-        let mut result = 0;
-
-        for offset in 0..length {
-            result <<= 8;
-            let byte_addr = addr + offset;
-            let byte = if byte_addr < self.rom.len() {
-                self.rom[byte_addr]
-            } else if byte_addr < 0x3F_FFFF {
-                self.cart_ram[byte_addr - self.rom.len()]
-            } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
-                self.ram[byte_addr - 0xFF_0000]
-            } else if (0xA0_0000..=0xA0_FFFF).contains(&byte_addr) {
-                // TODO: Determine if this is specially mapped
-                self.z80_ram[byte_addr - 0xA0_0000]
-            } else {
-                warn!("Unimplemented address {:#X}, reading zero", addr);
-                0
-            };
-
-            result |= byte as u32;
-        }
-
-        result
     }
 
     fn write(&mut self, address: u32, value: u32, size: Size) {
@@ -327,18 +249,28 @@ impl AddressSpace for CpuNoVdp {
             addr
         );
 
-        if (0xC0_00_00..=0xC0_00_0F).contains(&addr) {
-            panic!("Attempt to access VDP from CpuNoVdp!");
-        }
-
         match addr {
-            0xA1_0003..=0xA1_0004 => {
-                self.controller1.write_reg1(value as u8);
+            0xA0_0000..=0xA0_FFFF => {
+                panic!("Z80 attempted to write to itself");
+            }
+            0xA1_0002..=0xA1_0003 => {
+                assert_eq!(size, Size::Byte);
+                self.context.controller_1.write_reg1(value as u8);
                 return;
             }
-            0xA1_0009..=0xA1_000A => {
+            0xA1_0004..=0xA1_0005 => {
                 assert_eq!(size, Size::Byte);
-                self.controller1.write_reg2(value as u8);
+                self.context.controller_2.write_reg1(value as u8);
+                return;
+            }
+            0xA1_0008..=0xA1_0009 => {
+                assert_eq!(size, Size::Byte);
+                self.context.controller_1.write_reg2(value as u8);
+                return;
+            }
+            0xA1_000A..=0xA1_000B => {
+                assert_eq!(size, Size::Byte);
+                self.context.controller_2.write_reg2(value as u8);
                 return;
             }
             0xA1_0000..=0xA1_0002 | 0xA1_0005..=0xA1_000F => {
@@ -348,17 +280,16 @@ impl AddressSpace for CpuNoVdp {
             }
             0xA1_1100..=0xA1_1101 => {
                 // TODO:
-                warn!("Ignoring Z80 bus request");
-                return;
+                panic!("Z80 attempted to write to itself");
             }
             0xA1_1200 => {
                 // TODO:
-                warn!("Ignoring Z80 reset");
-                return;
+                panic!("Z80 attempted to write to itself");
             }
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
-                // TODO:
-                warn!("Ignoring write to PSG output");
+                // TODO: is this correct?
+                assert_eq!(size, Size::Byte);
+                self.context.psg.write_io(value as u8);
                 return;
             }
             0xA1_0020..=0xA1_10FF => {
@@ -371,7 +302,10 @@ impl AddressSpace for CpuNoVdp {
                 warn!("Ignoring write of {:#X} to SRAM register", value);
                 return;
             }
-            0xC0_0000..=0xC0_000F => panic!("Attempt to access VDP from CpuNoVdp!"),
+            0xC0_0000..=0xC0_000F => {
+                // TODO: Is this even legal?
+                todo!("Write to VDP")
+            }
             _ => {}
         }
 
@@ -379,15 +313,14 @@ impl AddressSpace for CpuNoVdp {
 
         for (offset, byte) in value.iter().enumerate() {
             let byte_addr = addr + offset;
-            if byte_addr < self.rom.len() {
+            if byte_addr < self.context.rom.len() {
                 info!("Ignoring write to ROM at {:#010X}", byte_addr);
             } else if byte_addr < 0x3F_FFFF {
-                self.cart_ram[byte_addr - self.rom.len()] = *byte;
+                self.context.cart_ram[byte_addr - self.context.rom.len()] = *byte;
             } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
-                self.ram[byte_addr - 0xFF_0000] = *byte;
-            } else if (0xA0_0000..=0xA0_FFFF).contains(&byte_addr) {
-                // TODO: Determine if this is specially mapped
-                self.z80_ram[byte_addr - 0xA0_0000] = *byte;
+                self.context.ram[byte_addr - 0xFF_0000] = *byte;
+            } else if (0xA0_0000..=0xA0_2000).contains(&byte_addr) {
+                panic!("Z80 attempted to write to itself");
             } else {
                 warn!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };

@@ -1,4 +1,4 @@
-use super::{address_space::AddressSpace, log_instr, Ccr, Cpu};
+use super::{address_space::AddressSpace, log_instr, Ccr, CpuAndContext};
 pub use addressing::*;
 use bitpat::bitpat;
 use either::Either;
@@ -12,7 +12,7 @@ use std::fmt;
 mod addressing;
 mod pages;
 
-fn read_immediate(cpu: &mut Cpu, size: Size) -> u32 {
+fn read_immediate(cpu: &mut CpuAndContext, size: Size) -> u32 {
     let new_size = if size == Size::Byte { Size::Word } else { size };
 
     let result = cpu.read(cpu.core.pc + 2, new_size);
@@ -310,7 +310,7 @@ impl Immediates {
         }
     }
 
-    fn read(&self, cpu: &mut Cpu) -> u32 {
+    fn read(&self, cpu: &mut CpuAndContext) -> u32 {
         if self.use_ccr() {
             cpu.core.ccr.0 as u32
         } else if self.use_sr() {
@@ -321,7 +321,7 @@ impl Immediates {
         }
     }
 
-    fn write(&self, value: u32, cpu: &mut Cpu) {
+    fn write(&self, value: u32, cpu: &mut CpuAndContext) {
         if self.use_ccr() {
             cpu.core.ccr.0 = value as u8;
         } else if self.use_sr() {
@@ -346,7 +346,7 @@ impl Instr for Immediates {
             }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let value = self.read(cpu);
 
         let arg = read_immediate(cpu, self.size);
@@ -423,7 +423,7 @@ impl BitOperation {
         2 + shift_size + self.mode.arg_length(Size::Byte)
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let shift_amount = if let Some(data_reg) = self.data_reg {
             data_reg.read(cpu)
         } else {
@@ -508,7 +508,7 @@ impl Instr for Miscellaneous {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match self {
             Miscellaneous::Link(reg) => {
                 Miscellaneous::link(*reg, cpu);
@@ -637,22 +637,22 @@ enum RegisterOrder {
 }
 
 impl RegisterOrder {
-    pub fn get(self, index: usize, cpu: &mut Cpu) -> &mut u32 {
+    pub fn get(self, index: usize, cpu: &mut crate::cpu::CpuCore) -> &mut u32 {
         assert!(index < 16);
 
         match self {
             RegisterOrder::AddrDataDescending => {
                 if index < 8 {
-                    &mut cpu.core.addr[7 - index]
+                    &mut cpu.addr[7 - index]
                 } else {
-                    &mut cpu.core.data[15 - index]
+                    &mut cpu.data[15 - index]
                 }
             }
             RegisterOrder::DataAddrAscending => {
                 if index < 8 {
-                    &mut cpu.core.data[index]
+                    &mut cpu.data[index]
                 } else {
-                    &mut cpu.core.addr[index - 8]
+                    &mut cpu.addr[index - 8]
                 }
             }
         }
@@ -660,7 +660,7 @@ impl RegisterOrder {
 }
 
 impl Miscellaneous {
-    fn link(reg: AddrReg, cpu: &mut Cpu) {
+    fn link(reg: AddrReg, cpu: &mut CpuAndContext) {
         cpu.core.addr[7] = cpu.core.addr[7].wrapping_sub(4);
         cpu.write(cpu.core.addr[7], reg.read(cpu), Size::Long);
         reg.write(cpu.core.addr[7], cpu);
@@ -669,14 +669,14 @@ impl Miscellaneous {
         cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(disp as u32);
     }
 
-    fn unlink(reg: AddrReg, cpu: &mut Cpu) {
+    fn unlink(reg: AddrReg, cpu: &mut CpuAndContext) {
         cpu.core.addr[7] = reg.read(cpu);
         let disp = cpu.read(cpu.core.addr[7], Size::Long);
         reg.write(disp, cpu);
         cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
     }
 
-    fn ext(size: Size, reg: DataReg, cpu: &mut Cpu) {
+    fn ext(size: Size, reg: DataReg, cpu: &mut CpuAndContext) {
         match size {
             Size::Word => {
                 let result = reg.read(cpu) as i8 as i16 as u32;
@@ -694,7 +694,7 @@ impl Miscellaneous {
         }
     }
 
-    fn movem_control(direction: bool, addr: &mut u32, size: Size, mask: u16, cpu: &mut Cpu) {
+    fn movem_control(direction: bool, addr: &mut u32, size: Size, mask: u16, cpu: &mut CpuAndContext) {
         for i in 0..16 {
             if mask & (1 << i) != 0 {
                 if direction {
@@ -704,9 +704,9 @@ impl Miscellaneous {
                         Size::Word => value as i16 as i32 as u32,
                         Size::Long => value,
                     };
-                    *RegisterOrder::DataAddrAscending.get(i, cpu) = value;
+                    *RegisterOrder::DataAddrAscending.get(i, cpu.core) = value;
                 } else {
-                    let value = *RegisterOrder::DataAddrAscending.get(i, cpu);
+                    let value = *RegisterOrder::DataAddrAscending.get(i, cpu.core);
                     cpu.write(*addr, value, size);
                 }
 
@@ -715,7 +715,7 @@ impl Miscellaneous {
         }
     }
 
-    fn movem(direction: bool, size: Size, mode: AddrMode, cpu: &mut Cpu) {
+    fn movem(direction: bool, size: Size, mode: AddrMode, cpu: &mut CpuAndContext) {
         match mode {
             AddrMode::Addr(reg) => {
                 // false -> register to memory
@@ -768,7 +768,7 @@ impl Miscellaneous {
                     if mask & (1 << i) != 0 {
                         cpu.core.addr[reg] = cpu.core.addr[reg].wrapping_sub(size.len() as u32);
 
-                        let value = *RegisterOrder::AddrDataDescending.get(i, cpu);
+                        let value = *RegisterOrder::AddrDataDescending.get(i, cpu.core);
                         cpu.write(cpu.core.addr[reg], value, size);
                     }
                 }
@@ -916,7 +916,7 @@ impl Branch {
         }
     }
 
-    fn displacement(&self, cpu: &mut Cpu) -> i32 {
+    fn displacement(&self, cpu: &mut CpuAndContext) -> i32 {
         match self.data {
             0xFF => cpu.read(cpu.core.pc + 2, Size::Long) as i32,
             0x00 => cpu.read(cpu.core.pc + 2, Size::Word) as i16 as i32,
@@ -934,7 +934,7 @@ impl Instr for Branch {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let displacement = self.displacement(cpu);
 
         if self.condition == Condition::False {
@@ -1016,7 +1016,7 @@ impl Instr for Move {
         2 + self.to_mode.arg_length(self.size) + self.from_mode.arg_length(self.size)
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let value = self.from_mode.read_offset(0, self.size, cpu);
 
         if let AddrMode::AddrReg(_) = self.to_mode {
@@ -1079,7 +1079,7 @@ impl Instr for MoveQ {
         2
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         cpu.core.ccr.set_overflow(false);
         cpu.core.ccr.set_carry(false);
         cpu.core.ccr.set_zero(self.value == 0);
@@ -1278,7 +1278,7 @@ impl Instr for LinearOp {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match &self.op_type {
             LinearOpType::Normal(dir, reg, mode) => {
                 let (dst, src) = if *dir {
@@ -1361,7 +1361,7 @@ impl Instr for ConditionsQuicks {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match self {
             ConditionsQuicks::AddSubQ {
                 is_sub,
@@ -1521,7 +1521,7 @@ impl Instr for CompareEor {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match &self.data {
             Either::Left(mode) => match mode {
                 CompareMode::Normal(dest_reg, source_mode) => {
@@ -1592,7 +1592,7 @@ impl fmt::Debug for Shifts {
 
 impl Shifts {
     // Left is thing being shifted, right is shift amount
-    fn get_args(&self, cpu: &mut Cpu) -> (u32, u32) {
+    fn get_args(&self, cpu: &mut CpuAndContext) -> (u32, u32) {
         match &self.data {
             Either::Left((_, amount, shiftee)) => {
                 let amount = amount.either(
@@ -1614,7 +1614,7 @@ impl Shifts {
         }
     }
 
-    fn write_back(&self, value: u32, cpu: &mut Cpu) {
+    fn write_back(&self, value: u32, cpu: &mut CpuAndContext) {
         match &self.data {
             Either::Left((size, _, shiftee)) => {
                 shiftee.write_sized(value, *size, cpu);
@@ -1634,7 +1634,7 @@ impl Instr for Shifts {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let (mut value, amount) = self.get_args(cpu);
 
         let width = self.get_size().len() * 8;
@@ -1840,7 +1840,7 @@ impl Instr for DivSubdOr {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match self {
             DivSubdOr::Div(_, _, _) => unimplemented!(),
             DivSubdOr::Subd(_, _) => unimplemented!(),
@@ -1902,7 +1902,7 @@ impl Instr for MoveP {
         4
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         let displacement = read_immediate(cpu, Size::Word);
 
         let addr = displacement.wrapping_add(self.addr_reg.read(cpu));
@@ -1923,7 +1923,7 @@ impl Instr for MoveP {
 }
 
 impl MoveP {
-    fn write_alt(data: &[u8], start_addr: u32, cpu: &mut Cpu) {
+    fn write_alt(data: &[u8], start_addr: u32, cpu: &mut CpuAndContext) {
         for (addr, byte) in data
             .iter()
             .enumerate()
@@ -1933,7 +1933,7 @@ impl MoveP {
         }
     }
 
-    fn read_alt(start_addr: u32, cpu: &mut Cpu, size: Size) -> u32 {
+    fn read_alt(start_addr: u32, cpu: &mut CpuAndContext, size: Size) -> u32 {
         let mut result = 0;
 
         for (i, addr) in (0..size.len())
@@ -1999,7 +1999,7 @@ impl Instr for MulAddExgAnd {
         }
     }
 
-    fn execute(&self, cpu: &mut Cpu) {
+    fn execute(&self, cpu: &mut CpuAndContext) {
         match self {
             MulAddExgAnd::And(data_reg, direction, size, mode) => {
                 let arg = mode.read_offset(0, *size, cpu);
@@ -2039,7 +2039,7 @@ impl Instr for MulAddExgAnd {
 }
 
 macro_rules! standalone_operation {
-    ($name:ident, fn $func_name:ident (&$self_name:ident, $cpu_name:ident : &mut Cpu) $body:block) => {
+    ($name:ident, fn $func_name:ident (&$self_name:ident, $cpu_name:ident : &mut CpuAndContext) $body:block) => {
         #[derive(Debug)]
         pub struct $name;
 
@@ -2048,18 +2048,18 @@ macro_rules! standalone_operation {
                 2
             }
 
-            fn $func_name(&$self_name, $cpu_name : &mut Cpu) {
+            fn $func_name(&$self_name, $cpu_name : &mut CpuAndContext) {
                 $body
             }
         }
     }
 }
 
-standalone_operation!(Illegal, fn execute(&self, _cpu: &mut Cpu) { panic!("Encountered illegal opcode") });
-standalone_operation!(Reset,   fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Reset") });
-standalone_operation!(Nop,     fn execute(&self, _cpu: &mut Cpu) { });
-standalone_operation!(Stop,    fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Stop") });
-standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) { 
+standalone_operation!(Illegal, fn execute(&self, _cpu: &mut CpuAndContext) { panic!("Encountered illegal opcode") });
+standalone_operation!(Reset,   fn execute(&self, _cpu: &mut CpuAndContext) { unimplemented!("Reset") });
+standalone_operation!(Nop,     fn execute(&self, _cpu: &mut CpuAndContext) { });
+standalone_operation!(Stop,    fn execute(&self, _cpu: &mut CpuAndContext) { unimplemented!("Stop") });
+standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut CpuAndContext) { 
     let new_sr = cpu.read(cpu.core.addr[7], Size::Word) as u16;
     cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(2);
     let new_pc = cpu.read(cpu.core.addr[7], Size::Long);
@@ -2074,7 +2074,7 @@ standalone_operation!(ExceptionReturn, fn execute(&self, cpu: &mut Cpu) {
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });
 
-standalone_operation!(Return, fn execute(&self, cpu: &mut Cpu) {
+standalone_operation!(Return, fn execute(&self, cpu: &mut CpuAndContext) {
     let new = cpu.read(cpu.core.addr[7], Size::Long);
     cpu.core.addr[7] = cpu.core.addr[7].wrapping_add(4);
 
@@ -2084,8 +2084,8 @@ standalone_operation!(Return, fn execute(&self, cpu: &mut Cpu) {
 
     cpu.core.pc = cpu.core.pc.wrapping_sub(self.size());
 });
-standalone_operation!(TrapOverflow, fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Trap overflow") });
-standalone_operation!(RestoreReturn, fn execute(&self, _cpu: &mut Cpu) { unimplemented!("Restore return") });
+standalone_operation!(TrapOverflow, fn execute(&self, _cpu: &mut CpuAndContext) { unimplemented!("Trap overflow") });
+standalone_operation!(RestoreReturn, fn execute(&self, _cpu: &mut CpuAndContext) { unimplemented!("Restore return") });
 
 /// Instructions on the 68k can be roughly divided into 'pages'
 /// based on the high nybble of their encoding.
@@ -2102,7 +2102,7 @@ impl Instruction {
         }
     }
 
-    pub fn execute(&self, cpu: &mut Cpu) {
+    pub fn execute(&self, cpu: &mut CpuAndContext) {
         self.opcode.execute(cpu);
 
         cpu.core.pc = cpu.core.pc.wrapping_add(self.opcode.size());

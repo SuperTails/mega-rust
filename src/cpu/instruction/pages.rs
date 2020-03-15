@@ -4,7 +4,7 @@ use bitpat::bitpat;
 pub trait Instr {
     fn size(&self) -> u32;
 
-    fn execute(&self, cpu: &mut Cpu);
+    fn execute(&self, cpu: &mut CpuAndContext);
 }
 
 macro_rules! make_dispatcher {
@@ -24,7 +24,7 @@ macro_rules! make_dispatcher {
                 }
             }
 
-            fn execute(&self, cpu: &mut Cpu) {
+            fn execute(&self, cpu: &mut CpuAndContext) {
                 match self {
                     $(Self::$varname(x) => {
                         x.execute(cpu)

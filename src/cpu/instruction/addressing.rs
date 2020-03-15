@@ -1,6 +1,6 @@
 use super::Size;
 use crate::cpu::log_instr;
-use crate::cpu::{address_space::AddressSpace, Cpu};
+use crate::cpu::{address_space::AddressSpace, CpuAndContext};
 use log::trace;
 use std::fmt;
 
@@ -68,7 +68,7 @@ impl AddrMode {
 
     // TODO: HOW DOES THIS WORK AT ALL?!
     // TODO: HOW TO FIND SCALE
-    fn address_index(self, extra: u32, cpu: &mut Cpu, reg: u32) -> Address {
+    fn address_index(self, extra: u32, cpu: &mut CpuAndContext, reg: u32) -> Address {
         let index_info = cpu.read(cpu.core.pc + extra + 2, Size::Byte) as u8;
         let offset = cpu.read(cpu.core.pc + extra + 3, Size::Byte) as u8 as i8;
 
@@ -101,7 +101,7 @@ impl AddrMode {
         Address::Address((reg as i64 + reg_offset as i64 + offset as i64) as u32)
     }
 
-    pub fn address(self, has_immediate: bool, size: Size, cpu: &mut Cpu) -> Address {
+    pub fn address(self, has_immediate: bool, size: Size, cpu: &mut CpuAndContext) -> Address {
         let extra = if has_immediate {
             (size.len() as u32 + 1) / 2 * 2
         } else {
@@ -111,7 +111,7 @@ impl AddrMode {
         self.address_offset(extra, cpu)
     }
 
-    pub fn address_offset(self, extra: u32, cpu: &mut Cpu) -> Address {
+    pub fn address_offset(self, extra: u32, cpu: &mut CpuAndContext) -> Address {
         match self {
             AddrMode::AbsLong => Address::Address(cpu.read(cpu.core.pc + extra + 2, Size::Long)),
             AddrMode::AbsShort => {
@@ -143,7 +143,7 @@ impl AddrMode {
         }
     }
 
-    pub fn read_offset(self, immediate_offset: u32, size: Size, cpu: &mut Cpu) -> u32 {
+    pub fn read_offset(self, immediate_offset: u32, size: Size, cpu: &mut CpuAndContext) -> u32 {
         if let AddrMode::AddrPreDecr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
@@ -156,7 +156,7 @@ impl AddrMode {
         address.read(size, cpu)
     }
 
-    pub fn write_offset(self, value: u32, immediate_offset: u32, size: Size, cpu: &mut Cpu) {
+    pub fn write_offset(self, value: u32, immediate_offset: u32, size: Size, cpu: &mut CpuAndContext) {
         if let AddrMode::AddrPreDecr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
@@ -203,7 +203,7 @@ pub enum Address {
 }
 
 impl Address {
-    pub fn read(&self, size: Size, cpu: &mut Cpu) -> u32 {
+    pub fn read(&self, size: Size, cpu: &mut CpuAndContext) -> u32 {
         match self {
             Address::DataReg(reg) => DataReg::new(*reg).read_sized(size, cpu),
             Address::AddrReg(reg) => AddrReg::new(*reg).read_sized(size, cpu),
@@ -211,7 +211,7 @@ impl Address {
         }
     }
 
-    pub fn write(&self, value: u32, size: Size, cpu: &mut Cpu) {
+    pub fn write(&self, value: u32, size: Size, cpu: &mut CpuAndContext) {
         match self {
             Address::DataReg(reg) => {
                 DataReg::new(*reg).write_sized(value, size, cpu);
@@ -233,19 +233,19 @@ impl DataReg {
         DataReg(reg)
     }
 
-    pub fn read(self, cpu: &Cpu) -> u32 {
+    pub fn read(self, cpu: &CpuAndContext) -> u32 {
         cpu.core.data[self.0 as usize]
     }
 
-    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
+    pub fn read_sized(self, size: Size, cpu: &CpuAndContext) -> u32 {
         cpu.core.data[self.0 as usize] & size.mask()
     }
 
-    pub fn write(self, value: u32, cpu: &mut Cpu) {
+    pub fn write(self, value: u32, cpu: &mut CpuAndContext) {
         cpu.core.data[self.0 as usize] = value;
     }
 
-    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
+    pub fn write_sized(self, value: u32, size: Size, cpu: &mut CpuAndContext) {
         cpu.core.data[self.0 as usize] &= !size.mask();
         cpu.core.data[self.0 as usize] |= value & size.mask();
     }
@@ -270,19 +270,19 @@ impl AddrReg {
         AddrReg(reg)
     }
 
-    pub fn read(self, cpu: &Cpu) -> u32 {
+    pub fn read(self, cpu: &CpuAndContext) -> u32 {
         cpu.core.addr[self.0 as usize]
     }
 
-    pub fn read_sized(self, size: Size, cpu: &Cpu) -> u32 {
+    pub fn read_sized(self, size: Size, cpu: &CpuAndContext) -> u32 {
         cpu.core.addr[self.0 as usize] & size.mask()
     }
 
-    pub fn write(self, value: u32, cpu: &mut Cpu) {
+    pub fn write(self, value: u32, cpu: &mut CpuAndContext) {
         cpu.core.addr[self.0 as usize] = value;
     }
 
-    pub fn write_sized(self, value: u32, size: Size, cpu: &mut Cpu) {
+    pub fn write_sized(self, value: u32, size: Size, cpu: &mut CpuAndContext) {
         cpu.core.addr[self.0 as usize] &= !size.mask();
         cpu.core.addr[self.0 as usize] |= value & size.mask();
     }
