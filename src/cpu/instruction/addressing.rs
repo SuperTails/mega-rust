@@ -143,7 +143,7 @@ impl AddrMode {
         }
     }
 
-    pub fn read_offset(self, immediate_offset: u32, size: Size, cpu: &mut CpuAndContext) -> u32 {
+    pub fn read_offset(self, immediate_offset: u32, mut size: Size, cpu: &mut CpuAndContext) -> u32 {
         if let AddrMode::AddrPreDecr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_sub(size.len() as u32);
@@ -152,6 +152,9 @@ impl AddrMode {
         if let AddrMode::AddrPostIncr(reg) = self {
             let reg = &mut cpu.core.addr[reg as usize];
             *reg = reg.wrapping_add(size.len() as u32);
+        }
+        if self == AddrMode::Immediate && size == Size::Byte {
+            size = Size::Word;
         }
         address.read(size, cpu)
     }

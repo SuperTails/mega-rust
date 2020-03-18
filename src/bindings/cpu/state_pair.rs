@@ -199,6 +199,11 @@ impl AddressSpace for StatePair {
                 warn!("Ignoring write of {:#X} to SRAM register", value);
                 return;
             }
+            0xA1_4000..=0xA1_4003 => {
+                // TODO:
+                info!("Ignoring write of {:#X} to TMSS register", value);
+                return;
+            }
             0xC0_0000..=0xC0_000F => {
                 cpu.end_timeslice(&mut context);
                 context.vdp.write(addr as u32, value, size, self);
@@ -228,12 +233,13 @@ impl AddressSpace for StatePair {
 }
 
 /// These pointers are valid ***ONLY*** while `MusashiCpu::do_cycle` is running
-pub static mut TEMP_DATA: StatePair = StatePair(
+pub const EMPTY_STATE: StatePair = StatePair(
     std::ptr::null_mut(),
     CpuViewRaw {
         vdp: null_mut(),
         z80: null_mut(),
         psg: null_mut(),
+        pending: null_mut(),
         controller_1: null_mut(),
         controller_2: null_mut(),
         rom: null_mut::<[u8; 0]>() as *mut [u8],
@@ -241,3 +247,5 @@ pub static mut TEMP_DATA: StatePair = StatePair(
         ram: null_mut::<[u8; 0]>() as *mut [u8],
     },
 );
+
+pub static mut TEMP_DATA: StatePair = EMPTY_STATE;

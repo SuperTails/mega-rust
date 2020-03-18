@@ -22,6 +22,7 @@ z80emu = "0.1"
 log = "0.4.8"
 fern = "0.5"
 chrono = "0.4.11"
+circular-queue = "0.2.3"
 emu76489-sys = { path = "../emu76489-sys" }
 nuked-opn2-sys = { path = "../nuked-opn2-sys" }
 

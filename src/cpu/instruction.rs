@@ -13,9 +13,13 @@ mod addressing;
 mod pages;
 
 fn read_immediate(cpu: &mut CpuAndContext, size: Size) -> u32 {
-    let new_size = if size == Size::Byte { Size::Word } else { size };
+    let read_size = match size {
+        Size::Byte => Size::Word,
+        Size::Word => Size::Word,
+        Size::Long => Size::Long,
+    };
 
-    let result = cpu.read(cpu.core.pc + 2, new_size);
+    let result = cpu.read(cpu.core.pc + 2, read_size);
     if size == Size::Byte && result >> 8 != 0 {
         warn!("Unused top byte of immediate: {:#X}", result >> 8);
     }
@@ -1011,6 +1015,12 @@ impl TryFrom<u16> for Move {
     }
 }
 
+impl Move {
+    fn is_movea(&self) -> bool {
+        matches!(self.to_mode, AddrMode::AddrReg(_)) && self.size != Size::Byte
+    }
+}
+
 impl Instr for Move {
     fn size(&self) -> u32 {
         2 + self.to_mode.arg_length(self.size) + self.from_mode.arg_length(self.size)
@@ -1019,9 +1029,8 @@ impl Instr for Move {
     fn execute(&self, cpu: &mut CpuAndContext) {
         let value = self.from_mode.read_offset(0, self.size, cpu);
 
-        if let AddrMode::AddrReg(_) = self.to_mode {
-            // Don't set flags for a MOVEA
-        } else {
+        // Flags are not set for MOVEA operations
+        if !self.is_movea() {
             cpu.core.ccr.set_overflow(false);
             cpu.core.ccr.set_carry(false);
             cpu.core.ccr.set_zero(value == 0);
@@ -1030,16 +1039,14 @@ impl Instr for Move {
 
         let offset = self.from_mode.arg_length(self.size);
 
-        if let AddrMode::AddrReg(reg) = self.to_mode {
-            let value_ext = if self.size == Size::Word {
-                value as i16 as i32 as u32
-            } else {
-                value
-            };
-            AddrReg::new(reg).write(value_ext, cpu);
+        let value_ext = if self.is_movea() && self.size == Size::Word {
+            // If we are doing a MOVEA and the source size is Word, we need to sign-extend
+            value as i16 as i32 as u32
         } else {
-            self.to_mode.write_offset(value, offset, self.size, cpu);
-        }
+            value
+        };
+
+        self.to_mode.write_offset(value_ext, offset, self.size, cpu);
     }
 }
 
@@ -1527,14 +1534,16 @@ impl Instr for CompareEor {
                 CompareMode::Normal(dest_reg, source_mode) => {
                     let dest = dest_reg.read(cpu);
                     let source = source_mode.read_offset(0, self.size, cpu);
-                    let new_ccr = compare(dest, source, self.size, false);
+                    let mut new_ccr = compare(dest, source, self.size, false);
+                    new_ccr.set_extend(cpu.core.ccr.extend());
                     cpu.core.ccr = new_ccr;
                 }
                 CompareMode::Address(dest_reg, source_mode) => {
                     // TODO: Make sure this is correct
                     let dest = dest_reg.read(cpu);
                     let source = source_mode.read_offset(0, self.size, cpu);
-                    let new_ccr = compare(dest, source, self.size, false);
+                    let mut new_ccr = compare(dest, source, self.size, false);
+                    new_ccr.set_extend(cpu.core.ccr.extend());
                     cpu.core.ccr = new_ccr;
                 }
                 _ => unimplemented!("Compare mode {:?}", mode),
@@ -1542,7 +1551,7 @@ impl Instr for CompareEor {
             Either::Right((reg, mode)) => {
                 let mut value = reg.read(cpu);
                 value ^= mode.read_offset(0, self.size, cpu) & self.size.mask();
-                reg.write(value, cpu);
+                mode.write_offset(value, 0, self.size, cpu);
 
                 cpu.core.ccr.set_zero(value == 0);
                 cpu.core.ccr.set_negative_sized(value, self.size);
@@ -1909,20 +1918,21 @@ impl Instr for MoveP {
 
         if self.direction {
             // Register to memory
-            let result = MoveP::read_alt(addr, cpu, self.size);
-            self.data_reg.write_sized(result, self.size, cpu);
-        } else {
-            // Memory to register
             if self.size == Size::Word {
                 MoveP::write_alt(&(self.data_reg.read(cpu) as u16).to_be_bytes(), addr, cpu);
             } else {
                 MoveP::write_alt(&self.data_reg.read(cpu).to_be_bytes(), addr, cpu);
             }
+        } else {
+            // Memory to register
+            let result = MoveP::read_alt(addr, cpu, self.size);
+            self.data_reg.write_sized(result, self.size, cpu);
         }
     }
 }
 
 impl MoveP {
+    /// Register to memory
     fn write_alt(data: &[u8], start_addr: u32, cpu: &mut CpuAndContext) {
         for (addr, byte) in data
             .iter()
@@ -1933,14 +1943,13 @@ impl MoveP {
         }
     }
 
+    /// Memory to register
     fn read_alt(start_addr: u32, cpu: &mut CpuAndContext, size: Size) -> u32 {
         let mut result = 0;
 
-        for (i, addr) in (0..size.len())
-            .map(|i| i as u32 * 2 + start_addr)
-            .enumerate()
-        {
-            result |= cpu.read(addr, Size::Byte) << (8 * i);
+        for addr in (0..size.len()).map(|i| i as u32 * 2 + start_addr) {
+            result <<= 8;
+            result |= cpu.read(addr, Size::Byte);
         }
 
         result

@@ -307,6 +307,8 @@ pub struct VdpInner {
     vsram: [u16; 40],
 
     debug_render: bool,
+
+    needs_render: bool,
 }
 
 impl VdpInner {
@@ -352,7 +354,14 @@ impl VdpInner {
             cram: [CRamEntry(0); 0x40],
             vsram: [0; 40],
             debug_render,
+            needs_render: false,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sync(&mut self, other: &mut VdpInner) {
+        self.cycle = other.cycle;
+        self.scanline = other.scanline;
     }
 
     fn horiz_scroll_mode(&self) -> HorizScrollMode {
@@ -642,7 +651,11 @@ impl VdpInner {
         sdl_system.canvas().present();
     }
 
-    pub fn do_cycle2(&mut self) -> (bool, bool) {
+    pub fn needs_render(&mut self) -> bool {
+        std::mem::replace(&mut self.needs_render, false)
+    }
+
+    pub fn do_cycle2(&mut self, int: &mut BinaryHeap<Interrupt>) -> (bool, bool) {
         self.cycle += 1;
 
         // TODO: It should be 488.5 I think,
@@ -653,6 +666,11 @@ impl VdpInner {
             // One scanline has finished
             self.scanline += 1;
             if self.horiz_int_counter == 0 {
+                if self.mode1.horiz_interrupt() && !int.iter().any(|i| i == &Interrupt::Horizontal)
+                {
+                    int.push(Interrupt::Horizontal);
+                }
+
                 self.horiz_int_counter = self.horiz_int_period;
             } else {
                 self.horiz_int_counter -= 1;
@@ -690,7 +708,12 @@ impl VdpInner {
             // One frame has finished
             self.scanline = 0;
 
-            warn!("Would have rendered");
+            if self.mode2.vert_interrupt() && !int.iter().any(|i| i == &Interrupt::Vertical) {
+                int.push(Interrupt::Vertical);
+            }
+
+            assert!(!self.needs_render);
+            self.needs_render = true;
 
             true
         } else {
@@ -778,7 +801,12 @@ impl VdpInner {
             false
         };
 
-        (result_1, result_2)
+        if self.needs_render() {
+            self.render(sdl_system);
+            (true, true)
+        } else {
+            (result_1, result_2)
+        }
     }
 
     // TODO: Make this correct

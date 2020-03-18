@@ -8,14 +8,22 @@ pub mod instruction;
 pub use cpu_core::*;
 
 use crate::bindings::context::CpuView;
+use crate::bindings::context::MemoryView;
 use crate::get_four_bytes;
 use crate::Interrupt;
 use address_space::AddressSpace;
 use instruction::{Instruction, Size};
 use lazy_static::lazy_static;
 use log::{info, trace, warn};
-use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+pub trait Cpu {
+    fn step(&mut self, context: &mut CpuView);
+
+    fn execute(&mut self, context: &mut CpuView) {
+        self.step(context)
+    }
+}
 
 lazy_static! {
     static ref LOG_INSTR: AtomicBool = AtomicBool::new(false);
@@ -29,13 +37,14 @@ pub fn log_instr() -> bool {
     LOG_INSTR.load(Ordering::SeqCst)
 }
 
-pub struct Cpu {
+#[derive(Debug, Clone, PartialEq)]
+pub struct RustCpu {
     pub core: CpuCore,
 }
 
-impl Cpu {
-    pub fn new() -> Cpu {
-        Cpu {
+impl RustCpu {
+    pub fn new() -> RustCpu {
+        RustCpu {
             core: CpuCore::new()
         }
     }
@@ -47,8 +56,8 @@ impl Cpu {
         }
     }
 
-    fn do_run(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
-        self.handle_interrupts(pending, context);
+    fn do_run(&mut self, context: &mut CpuView) {
+        self.handle_interrupts(context);
 
         assert_eq!(self.core.pc % 2, 0);
 
@@ -69,19 +78,6 @@ impl Cpu {
         }
     }
 
-    // TODO: Access Z80, VDP, expansion ports, and IO registers
-    pub fn do_cycle(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
-        match self.core.state {
-            State::Reset => {
-                self.do_reset(context);
-            }
-            State::Run => {
-                self.do_run(pending, context);
-            }
-        }
-    }
-
-
     pub fn instr_at(&mut self, addr: u32, context: &mut CpuView) -> Instruction {
         Instruction::new(self.with_context(context).read(addr, Size::Word) as u16)
     }
@@ -92,6 +88,8 @@ impl Cpu {
 
         let offset = self.core.pc as usize;
         let vector = u32::from_be_bytes(get_four_bytes(&context.rom[offset..offset + 4]));
+
+        // TODO: THIS IS WRONG APPARENTLY
         let sp = u32::from_be_bytes(get_four_bytes(&context.rom[0..4]));
 
         info!(
@@ -156,10 +154,10 @@ impl Cpu {
         info!("Did vertical interrupt");
     }
 
-    fn handle_interrupts(&mut self, pending: &mut BinaryHeap<Interrupt>, context: &mut CpuView) {
-        if let Some(int) = pending.peek() {
+    fn handle_interrupts(&mut self, context: &mut CpuView) {
+        if let Some(int) = context.pending.peek() {
             if *int as u8 > self.core.sr.priority() {
-                let int = pending.pop().unwrap();
+                let int = context.pending.pop().unwrap();
                 match int {
                     Interrupt::External => {
                         self.on_external_int(context);
@@ -171,6 +169,19 @@ impl Cpu {
                         self.on_vertical_int(context);
                     }
                 }
+            }
+        }
+    }
+}
+
+impl Cpu for RustCpu {
+    fn step(&mut self, context: &mut CpuView) {
+        match self.core.state {
+            State::Reset => {
+                self.do_reset(context);
+            }
+            State::Run => {
+                self.do_run(context);
             }
         }
     }
@@ -202,7 +213,11 @@ impl AddressSpace for CpuAndContext<'_, '_> {
                 assert_eq!(size, Size::Byte);
                 return self.context.controller_2.read_reg1() as u32;
             }
-            0xA1_1100..=0xA1_1101 => panic!("Z80 attempted to read itself"),
+            0xA1_1100..=0xA1_1101 => {
+                // TODO:
+                warn!("Returning 0 from Z80 bus request");
+                return 0;
+            },
             0xC0_0000..=0xC0_000F => {
                 return self.context.vdp.read(addr as u32) as u32;
             }
@@ -219,8 +234,7 @@ impl AddressSpace for CpuAndContext<'_, '_> {
         let loc = match addr {
             0..=0x3F_FFFF if addr < rom_len => &self.context.rom[addr..],
             0..=0x3F_FFFF => &self.context.cart_ram[addr - rom_len..],
-            // TODO:
-            0xA0_0000..=0xA0_FFFF => panic!("Z80 attempted to read itself"),
+            0xA0_0000..=0xA0_FFFF => &self.context.z80.ram_mut()[addr - 0xA0_0000..],
             0xFF_0000..=0xFF_FFFF => &self.context.ram[addr - 0xFF_0000..],
             _ => {
                 warn!("Unimplemented address {:#08X}, reading zero", addr);
@@ -250,10 +264,7 @@ impl AddressSpace for CpuAndContext<'_, '_> {
         );
 
         match addr {
-            0xA0_0000..=0xA0_FFFF => {
-                panic!("Z80 attempted to write to itself");
-            }
-            0xA1_0002..=0xA1_0003 => {
+           0xA1_0002..=0xA1_0003 => {
                 assert_eq!(size, Size::Byte);
                 self.context.controller_1.write_reg1(value as u8);
                 return;
@@ -280,11 +291,16 @@ impl AddressSpace for CpuAndContext<'_, '_> {
             }
             0xA1_1100..=0xA1_1101 => {
                 // TODO:
-                panic!("Z80 attempted to write to itself");
+                match value {
+                    0x0100 => self.context.z80.stopped = true,
+                    0x0000 => self.context.z80.stopped = false,
+                    _ => panic!("Invalid bus request write {:#X}", value),
+                }
+                return;
             }
             0xA1_1200 => {
-                // TODO:
-                panic!("Z80 attempted to write to itself");
+                warn!("Ignoring Z80 reset");
+                return;
             }
             0xC0_0011 | 0xC0_0013 | 0xC0_0015 | 0xC0_0017 => {
                 // TODO: is this correct?
@@ -302,9 +318,19 @@ impl AddressSpace for CpuAndContext<'_, '_> {
                 warn!("Ignoring write of {:#X} to SRAM register", value);
                 return;
             }
+            0xA1_4000..=0xA1_4003 => {
+                // TODO:
+                info!("Ignoring TMSS register write of {:#X}", value);
+                return;
+            }
             0xC0_0000..=0xC0_000F => {
-                // TODO: Is this even legal?
-                todo!("Write to VDP")
+                let mut memory = MemoryView {
+                    ram: self.context.ram,
+                    cart_ram: self.context.cart_ram,
+                    rom: self.context.rom,
+                };
+                self.context.vdp.write(addr as u32, value, size, &mut memory);
+                return;
             }
             _ => {}
         }
@@ -320,7 +346,7 @@ impl AddressSpace for CpuAndContext<'_, '_> {
             } else if (0xFF_0000..=0xFF_FFFF).contains(&byte_addr) {
                 self.context.ram[byte_addr - 0xFF_0000] = *byte;
             } else if (0xA0_0000..=0xA0_2000).contains(&byte_addr) {
-                panic!("Z80 attempted to write to itself");
+                self.context.z80.ram_mut()[byte_addr - 0xA0_0000] = *byte;
             } else {
                 warn!("UNIMPLEMENTED Write to {:#010X}", byte_addr);
             };

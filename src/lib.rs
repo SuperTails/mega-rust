@@ -9,13 +9,13 @@ mod z80;
 use bindings::context::Context;
 use bindings::cpu::MusashiCpu;
 use cart::Cart;
-use log::info;
+use log::{info, error};
 pub use log::LevelFilter;
 use sdl2::audio::AudioSpecDesired;
 use sdl_system::SDLSystem;
-use std::collections::BinaryHeap;
 use std::time::Instant;
 use z80::MdAudio;
+use circular_queue::CircularQueue;
 
 fn get_four_bytes(data: &[u8]) -> [u8; 4] {
     let mut result = [0; 4];
@@ -63,7 +63,7 @@ fn on_breakpoint(sdl_system: &mut SDLSystem) {
     }
 }
 
-fn on_scanline(context: &mut Context, sdl_system: &mut SDLSystem) -> bool {
+fn on_scanline<T: cpu::Cpu>(context: &mut Context<T>, sdl_system: &mut SDLSystem) -> bool {
     let events: Vec<_> = sdl_system.event_pump.poll_iter().collect();
     context.controller_1.update_buttons(&events);
     context.controller_2.update_buttons(&events);
@@ -175,17 +175,19 @@ pub struct Options {
     pub vdp_debug: bool,
 }
 
-pub fn run(cart: Cart, options: Options) {
+#[allow(dead_code)]
+fn compare(mut cart: Cart, options: Options) {
+    cart.rom_data[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFE, 0x00]);
     init_logger(options.log_level).unwrap();
-
-    log::warn!("TESTTESTTEST");
 
     let md_audio = MdAudio::new();
 
-    let mut context = Context::new(cart.rom_data, md_audio.clone(), options.vdp_debug).unwrap();
+    let mut context = Context::new_musashi(cart.rom_data.clone(), md_audio.clone(), options.vdp_debug).unwrap();
+    let mut context2 = Context::new_rust(cart.rom_data, md_audio.clone(), options.vdp_debug).unwrap();
+
+    let mut history = CircularQueue::with_capacity(5);
 
     let hit_breakpoint = false;
-    let mut pending: BinaryHeap<Interrupt> = BinaryHeap::new();
     let mut sdl_system = init_sdl(md_audio.data, options.silent);
 
     cpu::do_log(options.trace_instructions);
@@ -198,35 +200,158 @@ pub fn run(cart: Cart, options: Options) {
     'running: loop {
         i += 1;
 
+        if i == 1 {
+            context2.step(&mut sdl_system);
+        }
+
         if hit_breakpoint {
             on_breakpoint(&mut sdl_system);
         }
 
-        let (scan_finish, frame_finish) = context.update(&mut pending, &mut sdl_system);
+        let instr = {
+            let (cpu, mut view) = context2.cpu_view();
+            cpu.instr_at(cpu.core.pc, &mut view)
+        };
+        history.push((instr, context2.cpu.core.clone(), cpu::CpuCore::from_musashi(&context.cpu)));
+
+        context2.vdp.sync(&mut context.vdp);
+
+        let (scan_finish, frame_finish) = context.step(&mut sdl_system);
+        let (sf, _) = context2.step(&mut sdl_system);
 
         if scan_finish && on_scanline(&mut context, &mut sdl_system) {
+            break 'running;
+        }
+        if sf && on_scanline(&mut context2, &mut sdl_system) {
             break 'running;
         }
 
         if frame_finish {
             on_frame(&mut frames, &mut i, &mut last_i);
         }
+
+        if !cpu_eq(&context2.cpu, &context.cpu) {
+            let instrs = history.asc_iter().map(|i| format!("{:?}", i.0.opcode)).collect::<Vec<_>>();
+            error!("Instructions:\n{}", instrs.join("\n"));
+            error!("CPUs were not equal");
+            error!("Musashi core:\n{}", cpu::CpuCore::from_musashi(&context.cpu));
+            error!("Rust core:\n{}", context2.cpu.core);
+            panic!();
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+pub fn run(mut cart: Cart, options: Options) {
+    cart.rom_data[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFE, 0x00]);
+    init_logger(options.log_level).unwrap();
+
+    let md_audio = MdAudio::new();
+
+    let mut context = Context::new_musashi(cart.rom_data.clone(), md_audio.clone(), options.vdp_debug).unwrap();
+    let mut context2 = Context::new_rust(cart.rom_data, md_audio.clone(), options.vdp_debug).unwrap();
+
+    //let mut history = CircularQueue::with_capacity(5);
+
+    let hit_breakpoint = false;
+    let mut sdl_system = init_sdl(md_audio.data, options.silent);
+
+    cpu::do_log(options.trace_instructions);
+
+    let mut frames = vec![];
+
+    let mut last_i = 0;
+    let mut i = 0;
+
+    'running: loop {
+        i += 1;
+
+        if i == 1 {
+            context2.step(&mut sdl_system);
+        }
+
+        if hit_breakpoint {
+            on_breakpoint(&mut sdl_system);
+        }
+
+        /*let instr = {
+            let (cpu, mut view) = context2.cpu_view();
+            cpu.instr_at(cpu.core.pc, &mut view)
+        };
+        history.push((instr, context2.cpu.core.clone(), cpu::CpuCore::from_musashi(&context.cpu)));
+
+        context2.vdp.sync(&mut context.vdp);*/
+
+        let (scan_finish, frame_finish) = context.step(&mut sdl_system);
+        //let (sf, _) = context2.step(&mut sdl_system);
+
+        if scan_finish && on_scanline(&mut context, &mut sdl_system) {
+            break 'running;
+        }
+        /*if sf && on_scanline(&mut context2, &mut sdl_system) {
+            break 'running;
+        }*/
+
+        if frame_finish {
+            on_frame(&mut frames, &mut i, &mut last_i);
+        }
+
+        /*if !cpu_eq(&context2.cpu, &context.cpu) {
+            let instrs = history.asc_iter().map(|i| format!("{:?}", i.0.opcode)).collect::<Vec<_>>();
+            error!("Instructions:\n{}", instrs.join("\n"));
+            error!("CPUs were not equal");
+            error!("Musashi core:\n{}", cpu::CpuCore::from_musashi(&context.cpu));
+            error!("Rust core:\n{}", context2.cpu.core);
+            panic!();
+        }*/
     }
 }
 
 #[allow(dead_code)]
-fn cpu_eq(cpu1: &cpu::Cpu, cpu2: &MusashiCpu) -> bool {
+#[allow(clippy::useless_let_if_seq)]
+fn cpu_eq(cpu1: &cpu::RustCpu, cpu2: &MusashiCpu) -> bool {
     let mut cpu2_core = cpu::CpuCore::from_musashi(cpu2);
     cpu2_core.cycle = cpu1.core.cycle;
     cpu2_core.usp = cpu1.core.usp;
+    let mut cpu1 = cpu1.clone();
 
-    cpu1.core == cpu2_core
+    let mut correct = true;
+
+    if cpu1.core.addr != cpu2_core.addr {
+        error!("Incorrect address registers:");
+        error!("RUS: {:X?}", cpu1.core.addr);
+        error!("MUS: {:X?}", cpu2_core.addr);
+        cpu1.core.addr = cpu2_core.addr;
+        correct = false;
+    }
+
+    if cpu1.core.data != cpu2_core.data {
+        error!("Incorrect data registers:");
+        error!("RUS: {:X?}", cpu1.core.data);
+        error!("MUS: {:X?}", cpu2_core.data);
+        cpu1.core.data = cpu2_core.data;
+        correct = false;
+    }
+
+    if cpu1.core.pc != cpu2_core.pc {
+        error!("Incorrect PC registers:");
+        error!("RUS: {:#X}", cpu1.core.pc);
+        error!("MUS: {:#X}", cpu2_core.pc);
+        cpu1.core.pc = cpu2_core.pc;
+        correct = false;
+    }
+
+    if cpu1.core.ccr != cpu2_core.ccr {
+        error!("Incorrect CCR:");
+        error!("RUS: {}", cpu1.core.ccr);
+        error!("MUS: {}", cpu2_core.ccr);
+        cpu1.core.ccr = cpu2_core.ccr;
+        correct = false;
+    }
+
+    if cpu1.core != cpu2_core {
+        error!("Other difference");
+        correct = false;
+    }
+
+    correct
 }
